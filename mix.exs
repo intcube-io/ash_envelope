@@ -21,8 +21,8 @@ defmodule AshEnvelope.MixProject do
       dialyzer: [plt_add_apps: [:mix]],
       aliases: aliases(),
       package: package(),
-      source_url: "https://github.com/marcnnn/ash_envelope",
-      homepage_url: "https://github.com/marcnnn/ash_envelope"
+      source_url: "https://github.com/intcube-io/ash_envelope",
+      homepage_url: "https://github.com/intcube-io/ash_envelope"
     ]
   end
 
@@ -144,8 +144,8 @@ defmodule AshEnvelope.MixProject do
       licenses: ["MIT"],
       files: ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* documentation),
       links: %{
-        "GitHub" => "https://github.com/marcnnn/ash_envelope",
-        "Changelog" => "https://github.com/marcnnn/ash_envelope/blob/main/CHANGELOG.md",
+        "GitHub" => "https://github.com/intcube-io/ash_envelope",
+        "Changelog" => "https://github.com/intcube-io/ash_envelope/blob/main/CHANGELOG.md",
         "Discord" => "https://discord.gg/HTHRaaVPUc",
         "Website" => "https://ash-hq.org",
         "Forum" => "https://elixirforum.com/c/elixir-framework-forums/ash-framework-forum"
