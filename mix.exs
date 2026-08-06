@@ -99,7 +99,7 @@ defmodule AshEnvelope.MixProject do
       {:ash_storage,
        ash_storage_version(
          git: "https://github.com/wln/ash_storage.git",
-         branch: "blobio/06-proxy-actor-lifetime"
+         branch: "blobio5/serving-disposition"
        )},
       {:spark, "~> 2.0"},
       {:plug, "~> 1.14", optional: true},
