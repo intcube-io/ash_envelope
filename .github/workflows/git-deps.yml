@@ -1,0 +1,25 @@
+name: Git dependency pins
+
+# Kept separate from elixir.yml on purpose. That workflow delegates to the
+# shared ash-project/ash reusable workflow, which currently fails to resolve
+# (every run since 2026-06-01 is a startup_failure). This guard is
+# self-contained so it runs regardless of that.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Surface upstream drift on the ash_storage branch pin without needing a PR.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  git-deps:
+    name: git dependency pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify git dependency pins still resolve
+        run: .github/scripts/check-git-deps.sh
