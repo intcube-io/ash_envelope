@@ -69,23 +69,12 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
   def rotate(blob, opts) do
     with {:ok, previous_private_key} <- fetch_previous_private_key(opts),
          {:ok, current_public_key} <- fetch_current_public_key(),
-         {:ok, layer_index, layer_entry, layer_metadata, backup, _key_id} <-
+         {:ok, _layer_index, _layer_entry, _layer_metadata, backup, _key_id} <-
            locate_layer(blob) do
-      cond do
-        Backup.key_id(current_public_key) == backup["key_id"] ->
-          {:ok, blob}
-
-        true ->
-          do_rotate(
-            blob,
-            layer_index,
-            layer_entry,
-            layer_metadata,
-            backup,
-            previous_private_key,
-            current_public_key,
-            opts
-          )
+      if Backup.key_id(current_public_key) == backup["key_id"] do
+        {:ok, blob}
+      else
+        do_rotate(blob, backup, previous_private_key, current_public_key, opts)
       end
     end
   end
@@ -138,35 +127,44 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
     |> then(&{:ok, &1})
   end
 
-  defp do_rotate(
-         blob,
-         layer_index,
-         layer_entry,
-         layer_metadata,
-         backup,
-         previous_private_key,
-         current_public_key,
-         opts
-       ) do
-    with {:ok, dek} <- Backup.unwrap_backup(backup, previous_private_key) do
+  # Writes back the blob's entire metadata map — an unguarded
+  # read-modify-write. The blob typically arrives from a long batch
+  # stream, so it is re-fetched immediately before computing the new
+  # metadata; that shrinks the clobber window for concurrent metadata
+  # writers from the whole batch pass to milliseconds. Full protection
+  # needs optimistic locking upstream in ash_storage.
+  defp do_rotate(blob, backup, previous_private_key, current_public_key, opts) do
+    ash_opts = Keyword.get(opts, :ash_opts, [])
+
+    with {:ok, dek} <- Backup.unwrap_backup(backup, previous_private_key),
+         {:ok, fresh_blob} <- refetch(blob, ash_opts),
+         {:ok, layer_index, layer_entry, layer_metadata, _backup, _key_id} <-
+           locate_layer(fresh_blob) do
       new_backup = Backup.wrap_for_public_key(dek, current_public_key)
       wrapped_dek = Map.fetch!(layer_metadata, "wrapped_dek")
       new_wrapped_dek = Backup.put_backup(wrapped_dek, new_backup)
       new_layer_metadata = Map.put(layer_metadata, "wrapped_dek", new_wrapped_dek)
 
       new_layer_entry = put_entry_metadata(layer_entry, new_layer_metadata)
-      layer_chain = layer_chain(blob.metadata)
+      layer_chain = layer_chain(fresh_blob.metadata)
       new_layer_chain = List.replace_at(layer_chain, layer_index, new_layer_entry)
 
-      new_metadata = Support.put_layer_metadata(blob.metadata || %{}, new_layer_chain)
-      ash_opts = Keyword.get(opts, :ash_opts, [])
+      new_metadata = Support.put_layer_metadata(fresh_blob.metadata || %{}, new_layer_chain)
 
       Ash.update(
-        blob,
+        fresh_blob,
         %{metadata: new_metadata},
         Keyword.merge(ash_opts, action: :update_metadata)
       )
     end
+  end
+
+  defp refetch(blob, ash_opts) do
+    Ash.get(
+      blob.__struct__,
+      blob.id,
+      Keyword.take(ash_opts, [:domain, :actor, :authorize?, :tenant])
+    )
   end
 
   defp classify(%{metadata: metadata}), do: classify(metadata)

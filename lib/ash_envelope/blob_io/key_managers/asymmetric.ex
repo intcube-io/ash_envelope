@@ -36,9 +36,9 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
     @behaviour AshStorage.Encryption.KeyManager
 
     alias AshEnvelope.BlobIO.Backup
-    alias AshStorage.Encryption.RewrapOperation
     alias AshStorage.BlobIO.Reader
     alias AshStorage.BlobIO.Writer
+    alias AshStorage.Encryption.RewrapOperation
 
     @format "x25519-ecies-v1"
 
@@ -99,15 +99,42 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
 
     defp resolve_public_key(actor, opts) do
       with {:ok, attr} <- fetch_option(opts, :actor_public_key_attribute) do
-        {:ok, AshEnvelope.resolve_actor_key(actor, attr)}
+        resolve_actor_key(actor, attr)
       end
     end
 
     defp resolve_private_key(actor, opts) do
       with {:ok, attr} <- fetch_option(opts, :actor_private_key_attribute) do
-        {:ok, AshEnvelope.resolve_actor_key(actor, attr)}
+        resolve_actor_key(actor, attr)
       end
     end
+
+    # Non-raising counterpart of `AshEnvelope.resolve_actor_key/2`. Key
+    # managers run inside read/write pipelines, so a nil actor (e.g. an
+    # unauthenticated read) must surface as an error tuple — matching the
+    # KeyGrants manager's `:missing_principal` — rather than crash the
+    # request mid-flight.
+    defp resolve_actor_key(actor, attr) when is_map(actor) do
+      case Map.get(actor, attr) do
+        nil ->
+          {:error, :missing_principal}
+
+        <<key::binary-32>> ->
+          {:ok, key}
+
+        raw when is_binary(raw) ->
+          case Base.decode64(raw) do
+            {:ok, <<key::binary-32>>} -> {:ok, key}
+            _ -> {:error, :invalid_actor_key}
+          end
+
+        _ ->
+          {:error, :invalid_actor_key}
+      end
+    end
+
+    defp resolve_actor_key(nil, _attr), do: {:error, :missing_principal}
+    defp resolve_actor_key(_actor, _attr), do: {:error, :invalid_actor_key}
 
     defp fetch_option(opts, key) do
       case Keyword.fetch(opts, key) do

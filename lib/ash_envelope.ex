@@ -167,20 +167,31 @@ defmodule AshEnvelope do
 
   Only the holder of the corresponding private key can unwrap. Wrapping
   the same DEK twice produces different ciphertexts (fresh ephemeral each time).
+
+  Raises `ArgumentError` when `recipient_public_key` is not a valid X25519
+  public key — for example a degenerate or low-order point (such as 32 zero
+  bytes) for which no shared secret can be derived.
   """
   @spec wrap_dek(binary(), binary()) :: binary()
   def wrap_dek(raw_dek, recipient_public_key)
       when byte_size(raw_dek) == 32 and byte_size(recipient_public_key) == 32 do
     {eph_public, eph_private} = :crypto.generate_key(:ecdh, :x25519)
-    shared_secret = :crypto.compute_key(:ecdh, recipient_public_key, eph_private, :x25519)
-    derived_key = hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
 
-    iv = :crypto.strong_rand_bytes(12)
+    case compute_shared_secret(recipient_public_key, eph_private) do
+      {:ok, shared_secret} ->
+        derived_key = hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
 
-    {ciphertext, tag} =
-      :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, raw_dek, "", true)
+        iv = :crypto.strong_rand_bytes(12)
 
-    eph_public <> iv <> tag <> ciphertext
+        {ciphertext, tag} =
+          :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, raw_dek, "", true)
+
+        eph_public <> iv <> tag <> ciphertext
+
+      :error ->
+        raise ArgumentError,
+              "recipient public key is not a valid X25519 public key (degenerate or low-order point)"
+    end
   end
 
   @doc """
@@ -189,7 +200,9 @@ defmodule AshEnvelope do
 
   Returns `{:ok, raw_dek}` (32-byte binary), `{:error, :malformed_blob}`
   if the blob doesn't match the expected layout, or
-  `{:error, :decryption_failed}` if authentication fails.
+  `{:error, :decryption_failed}` if authentication fails or the embedded
+  ephemeral public key is a degenerate/low-order X25519 point (a blob
+  carrying such a point is indistinguishable from a tampered one).
   """
   @spec unwrap_dek(binary(), binary()) ::
           {:ok, binary()} | {:error, :malformed_blob | :decryption_failed}
@@ -198,26 +211,43 @@ defmodule AshEnvelope do
         recipient_private_key
       )
       when byte_size(recipient_private_key) == 32 do
-    shared_secret = :crypto.compute_key(:ecdh, eph_public, recipient_private_key, :x25519)
-    derived_key = hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
+    case compute_shared_secret(eph_public, recipient_private_key) do
+      {:ok, shared_secret} ->
+        derived_key = hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
 
-    case :crypto.crypto_one_time_aead(
-           :aes_256_gcm,
-           derived_key,
-           iv,
-           ciphertext,
-           "",
-           tag,
-           false
-         ) do
-      :error -> {:error, :decryption_failed}
-      plaintext -> {:ok, plaintext}
+        case :crypto.crypto_one_time_aead(
+               :aes_256_gcm,
+               derived_key,
+               iv,
+               ciphertext,
+               "",
+               tag,
+               false
+             ) do
+          :error -> {:error, :decryption_failed}
+          plaintext -> {:ok, plaintext}
+        end
+
+      :error ->
+        {:error, :decryption_failed}
     end
   end
 
   def unwrap_dek(_blob, recipient_private_key)
       when byte_size(recipient_private_key) == 32 do
     {:error, :malformed_blob}
+  end
+
+  # X25519 ECDH. :crypto.compute_key/4 raises ErlangError
+  # ("Can't EVP_PKEY_derive") for degenerate/low-order points such as an
+  # all-zero public key, so the failure is normalized to `:error` here and
+  # mapped by callers: `unwrap_dek/2` treats it as `:decryption_failed`
+  # (a low-order point in a blob is indistinguishable from tampering),
+  # `wrap_dek/2` raises a clear ArgumentError.
+  defp compute_shared_secret(public_key, private_key) do
+    {:ok, :crypto.compute_key(:ecdh, public_key, private_key, :x25519)}
+  rescue
+    ErlangError -> :error
   end
 
   # -- Helpers --
