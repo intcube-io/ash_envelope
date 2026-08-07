@@ -15,23 +15,23 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 ### Retired briefly-shipped `mix ash_envelope.gen.proxy_route`:
 
-- An intermediate hand-written-controller generator (`mix ash_envelope.gen.proxy_route`) shipped earlier in this v0.4-dev branch to work around `AshStorage.Plug.Proxy`'s lack of actor threading. With the upstream change above the generator is no longer load-bearing — a 6-line `forward "/storage", AshStorage.Plug.Proxy, …` replaces an ~80-line custom controller — so the task and its test are removed in the same pass.
+- An intermediate hand-written-controller generator (`mix ash_envelope.gen.proxy_route`) shipped earlier in this unreleased development cycle to work around `AshStorage.Plug.Proxy`'s lack of actor threading. With the upstream change above the generator is no longer load-bearing — a 6-line `forward "/storage", AshStorage.Plug.Proxy, …` replaces an ~80-line custom controller — so the task and its test are removed in the same pass.
 - If you ran the previous version of the generator and committed its output, delete the generated controller and replace your router scope with the upstream-proxy `forward` block per the topic doc. The signing-secret config key is unchanged; the encryption layer's `:proxy_base_url` is unchanged; the 300-second cap is preserved.
 
 ### Field encryption with optional AAD binding (`encrypt/3` / `decrypt/3`):
 
-- `AshEnvelope.encrypt/2` and `decrypt/2` are replaced by `encrypt/3` and `decrypt/3` with optional `:context` AAD via the third argument. Existing callers (`encrypt(plaintext, key)`) work unchanged — the `opts` arg defaults to `[]`, and empty AAD matches the historical wire format, so ciphertexts written with v0.3.x decrypt fine.
+- `AshEnvelope.encrypt/2` and `decrypt/2` are replaced by `encrypt/3` and `decrypt/3` with optional `:context` AAD via the third argument. Existing callers (`encrypt(plaintext, key)`) work unchanged — the `opts` arg defaults to `[]`, and empty AAD matches the historical wire format, so ciphertexts written by previous releases decrypt fine.
 - New: passing `:context` (typically `to_string(record.id)`) binds the ciphertext to a row. A DBA who swaps `body_ciphertext` between rows triggers `:decryption_failed` instead of disclosing one row's body under another row's identity — the field-level analogue of `AshEnvelope.SealKey`'s AAD binding for ephemeral worker rows.
 - Use-case framing (in the moduledoc and tutorial): these functions are the **symmetric step of the multi-recipient grant pattern** for non-blob fields, not generic field encryption. Encrypt the field once with a per-record DEK, then wrap that DEK into one grant row per recipient via `AshEnvelope.KeyGrants`. For **single-key** field encryption with one app-wide vault key (no per-record DEK, no grants), use [`ash_cloak`](https://hexdocs.pm/ash_cloak) — the two libraries cover different use cases.
-- Note: an earlier v0.4-dev iteration removed these functions on the (mistaken) assumption they duplicated cloak's surface. They don't — cloak's vault model doesn't accommodate the per-record DEK pattern. The functions are restored with AAD support and clearer framing.
+- Note: an earlier unreleased iteration removed these functions on the (mistaken) assumption they duplicated cloak's surface. They don't — cloak's vault model doesn't accommodate the per-record DEK pattern. The functions are restored with AAD support and clearer framing.
 
 ### Breaking changes (`AshEnvelope.Storage` removed; BlobIO is the new integration point):
 
-- The `AshEnvelope.Storage` Spark extension, `AshEnvelope.Storage.Encrypted` wrapping service, `AshEnvelope.Storage.Plug`, the `encryption do ... end` DSL block, and the `:simple` / `:actor_wrapped` / `:key_grants` mode discriminator are all removed. Replaced by two `AshStorage.BlobIO.Encryption.KeyManager` implementations that plug into the standard `AshStorage.BlobIO.Layer.Encryption`:
+- The `AshEnvelope.Storage` Spark extension, `AshEnvelope.Storage.Encrypted` wrapping service, `AshEnvelope.Storage.Plug`, the `encryption do ... end` DSL block, and the `:simple` / `:actor_wrapped` / `:key_grants` mode discriminator are all removed. Replaced by two `AshStorage.Encryption.KeyManager` implementations that plug into the standard `AshStorage.Layer.Encryption`:
   - `AshEnvelope.BlobIO.KeyManagers.Asymmetric` — successor to `:actor_wrapped`. DEK wrapped with the actor's X25519 public key.
   - `AshEnvelope.BlobIO.KeyManagers.KeyGrants` — successor to `:key_grants`. Fan-out into `AshEnvelope.KeyGrants` via BlobIO's `finalize_wrapped_dek` callback (no more process-dictionary handoff).
-- The `:simple` mode is gone. The risk-assessment finding T1 (`:simple` mode + DBA → plaintext disclosure, Inacceptable) is resolved by removing the code path; there is no replacement KeyManager in `ash_envelope` for the "DEK alongside ciphertext" pattern. Single-recipient deployments use `Asymmetric`; deployments that want a Cloak vault use the upstream `AshStorage.BlobIO.Encryption.KeyManagers.Cloak`.
-- `ash_storage` is now pinned to the `wln/ash_storage` `blobio/06-proxy-actor-lifetime` branch (tip of the rebuilt `blobio/*` stack) until BlobIO lands on `main`.
+- The `:simple` mode is gone. The risk-assessment finding T1 (`:simple` mode + DBA → plaintext disclosure, Inacceptable) is resolved by removing the code path; there is no replacement KeyManager in `ash_envelope` for the "DEK alongside ciphertext" pattern. Single-recipient deployments use `Asymmetric`; deployments that want a Cloak vault use the upstream `AshStorage.Encryption.KeyManagers.Cloak`.
+- `ash_storage` is now pinned to the `wln/ash_storage` `blobio5/serving-disposition` branch until BlobIO lands on `main`.
 - `AshEnvelope.Reconcile` is now the sole source for `domain`, `key_grants_resource`, `actor_public_key_attribute`, `actor_private_key_attribute`, and the related `key_grants_*` field overrides. The compile-time single-source rule and the storage-fallback branch in `Info.context/1` are removed. Migration: move the equivalents from your old `encryption do ... end` block into `reconcile do ... end`.
 
 ### Backup-key escrow (opt-in):
@@ -44,7 +44,7 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 ### Security review
 
-A full SQUARE-based risk assessment of the library was completed on 2026-05-11 and 2026-05-12. It identifies the library's threat model, rates each finding using BSI 200-2 damage potential and ISO/IEC 18045 attack potential, and derives 18 security requirements and 8 environmental assumptions. The full assessment lives in [`documentation/security/risk-assessment/`](documentation/security/risk-assessment/00_overview.md), and the user-facing summary is in [`documentation/topics/how-envelope-encryption-works.md`](documentation/topics/how-envelope-encryption-works.md) under "Security Posture". The next review is due 2027-05.
+A full SQUARE-based risk assessment of the library was completed on 2026-05-11 and 2026-05-12. It identifies the library's threat model, rates each finding using BSI 200-2 damage potential and ISO/IEC 18045 attack potential, and derives 18 security requirements and 8 environmental assumptions. The full assessment lives in [`documentation/security/risk-assessment/`](https://github.com/intcube-io/ash_envelope/blob/main/documentation/security/risk-assessment/00_overview.md), and the user-facing summary is in [`documentation/topics/how-envelope-encryption-works.md`](documentation/topics/how-envelope-encryption-works.md) under "Security Posture". The next review is due 2027-05.
 
 ### Breaking changes (`AshEnvelope.KeyGrants`, `AshEnvelope.GrantRequests`):
 
@@ -73,7 +73,7 @@ A full SQUARE-based risk assessment of the library was completed on 2026-05-11 a
 - Removed `{Mod, :fun}` and `{Mod, :fun, args}` host-callback granter strategies. The `:request` strategy plus the `:when` predicate on tuple-form strategies cover the same extension cases.
 - Removed `Runner.run_for_principal/4`. Callers should use `Runner.run/3` directly with a `[{principal_id, subject_id}, ...]` pair list.
 
-## [v0.1.0](https://github.com/marcnnn/ash_envelope/compare/v0.1.0) (2026-03-10)
+## v0.1.0 (2026-03-10)
 
 Initial release.
 
