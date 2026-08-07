@@ -1,14 +1,66 @@
 name: CI
+
+# Self-contained CI. This used to delegate to the reusable
+# ash-project/ash/.github/workflows/ash-ci.yml@main workflow, but that
+# reference has failed to resolve since 2026-06-01 (every run was a
+# startup_failure), meaning no checks actually ran.
+#
+# There is intentionally no Hex release/publish job: the package cannot be
+# published to Hex while ash_storage is a git dependency (Hex rejects
+# packages that depend on git/path deps). Reintroduce a publish job once
+# ash_storage ships on Hex and the pin in mix.exs moves to a Hex requirement.
+
 on:
   push:
-    tags:
-      - "v*"
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_call:
+  workflow_dispatch:
+
+env:
+  MIX_ENV: test
+
 jobs:
-  ash-ci:
-    uses: ash-project/ash/.github/workflows/ash-ci.yml@main
-    secrets:
-      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+  ci:
+    name: mix checks (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.18"
+            otp: "27"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Credo
+        run: mix credo --strict
+
+      - name: Tests
+        run: mix test
+
+      - name: Sobelow
+        run: mix sobelow --skip
