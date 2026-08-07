@@ -139,6 +139,45 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
       assert BackupRotation.needs_rotation?(rotated) == false
     end
 
+    test "wrong previous private key fails cleanly and leaves the blob unchanged", %{
+      actor: actor
+    } do
+      {old_pub, _old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      post =
+        @resource
+        |> Ash.create!(%{title: "Wrong key"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "don't clobber me", filename: "w.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      blob = post.__metadata__[:blob]
+
+      {new_pub, _new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      {:ok, blob} = Ash.get(@blob_resource, blob.id, domain: @domain)
+
+      {_pub, wrong_priv} = AshEnvelope.generate_key_pair()
+
+      assert {:error, :decryption_failed} =
+               BackupRotation.rotate(blob, previous_private_key: wrong_priv)
+
+      # Nothing was written: the stored metadata still carries the old
+      # key's fingerprint and the blob still needs rotation.
+      {:ok, reread} = Ash.get(@blob_resource, blob.id, domain: @domain)
+      assert reread.metadata == blob.metadata
+
+      [%{"metadata" => layer_metadata}] = reread.metadata["ash_storage"]["blob_io"]["layers"]
+      assert layer_metadata["wrapped_dek"]["backup"]["key_id"] == Backup.key_id(old_pub)
+      assert BackupRotation.needs_rotation?(reread) == true
+    end
+
     test "is idempotent when the blob already uses the current key", %{actor: actor} do
       {pub, _priv} = AshEnvelope.generate_key_pair()
       Application.put_env(:ash_envelope, :backup_public_key, pub)

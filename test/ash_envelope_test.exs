@@ -1,6 +1,15 @@
 defmodule AshEnvelopeTest do
   use ExUnit.Case, async: true
 
+  import Bitwise
+
+  # Flip the lowest bit of the byte at `byte_index`, leaving the rest of
+  # the binary untouched — the smallest possible tamper.
+  defp flip_bit(binary, byte_index) do
+    <<prefix::binary-size(byte_index), byte, rest::binary>> = binary
+    <<prefix::binary, bxor(byte, 1), rest::binary>>
+  end
+
   describe "encrypt/3 and decrypt/3" do
     test "round-trips arbitrary data with no AAD" do
       key = AshEnvelope.generate_dek()
@@ -47,6 +56,19 @@ defmodule AshEnvelopeTest do
     test "malformed ciphertext returns :malformed_blob" do
       key = AshEnvelope.generate_dek()
       assert AshEnvelope.decrypt(<<0::8>>, key) == {:error, :malformed_blob}
+    end
+
+    # Blob layout is IV(12) || TAG(16) || ciphertext. Flipping a single
+    # bit anywhere must fail authentication, never return plaintext or
+    # raise.
+    test "single-bit tamper in IV, tag, or ciphertext fails to decrypt" do
+      key = AshEnvelope.generate_dek()
+      ciphertext = AshEnvelope.encrypt("tamper target", key)
+
+      for byte_index <- [0, 12, 28] do
+        tampered = flip_bit(ciphertext, byte_index)
+        assert AshEnvelope.decrypt(tampered, key) == {:error, :decryption_failed}
+      end
     end
   end
 
@@ -167,6 +189,50 @@ defmodule AshEnvelopeTest do
       wrapped = AshEnvelope.wrap_dek(dek, recipient_pub)
 
       assert AshEnvelope.unwrap_dek(wrapped, recipient_priv) == {:ok, dek}
+    end
+
+    # Blob layout is ephemeral_public(32) || IV(12) || TAG(16) ||
+    # ciphertext(32). Flipping a single bit anywhere — including the
+    # ephemeral public-key prefix, which feeds ECDH rather than the
+    # AEAD — must return an error tuple, never plaintext or a raise.
+    test "single-bit tamper anywhere in the blob fails to unwrap" do
+      {pub, priv} = AshEnvelope.generate_key_pair()
+      dek = AshEnvelope.generate_dek()
+      wrapped = AshEnvelope.wrap_dek(dek, pub)
+
+      for byte_index <- [0, 31, 32, 44, 60] do
+        tampered = flip_bit(wrapped, byte_index)
+        assert AshEnvelope.unwrap_dek(tampered, priv) == {:error, :decryption_failed}
+      end
+    end
+
+    test "too-short blob returns :malformed_blob" do
+      {_pub, priv} = AshEnvelope.generate_key_pair()
+      assert AshEnvelope.unwrap_dek(<<0::size(59 * 8)>>, priv) == {:error, :malformed_blob}
+    end
+
+    # Regression: an all-zero ephemeral public key is a degenerate
+    # X25519 point for which :crypto.compute_key/4 raises. It must
+    # surface as :decryption_failed — indistinguishable from tampering —
+    # not as a crash.
+    test "all-zero ephemeral public key fails as :decryption_failed" do
+      {pub, priv} = AshEnvelope.generate_key_pair()
+      dek = AshEnvelope.generate_dek()
+
+      <<_eph::binary-32, rest::binary>> = AshEnvelope.wrap_dek(dek, pub)
+      degenerate = <<0::size(32 * 8)>> <> rest
+
+      assert AshEnvelope.unwrap_dek(degenerate, priv) == {:error, :decryption_failed}
+    end
+
+    # The wrap side of the same degenerate-point failure: wrap_dek/2
+    # returns a bare binary, so it raises a clear ArgumentError instead.
+    test "wrap_dek/2 raises ArgumentError for an all-zero recipient public key" do
+      dek = AshEnvelope.generate_dek()
+
+      assert_raise ArgumentError, ~r/not a valid X25519 public key/, fn ->
+        AshEnvelope.wrap_dek(dek, <<0::size(32 * 8)>>)
+      end
     end
   end
 

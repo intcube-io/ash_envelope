@@ -3,9 +3,9 @@ defmodule AshEnvelope.BlobIO.KeyManagers.AsymmetricTest do
 
   alias AshEnvelope.BlobIO.KeyManagers.Asymmetric
   alias AshStorage.BlobIO.BlobContext
-  alias AshStorage.Encryption.RewrapOperation
   alias AshStorage.BlobIO.Reader
   alias AshStorage.BlobIO.Writer
+  alias AshStorage.Encryption.RewrapOperation
 
   setup do
     {pub, priv} = AshEnvelope.generate_key_pair()
@@ -61,6 +61,48 @@ defmodule AshEnvelope.BlobIO.KeyManagers.AsymmetricTest do
                Asymmetric.wrap_dek(dek, write_op(actor),
                  actor_private_key_attribute: :private_key
                )
+    end
+
+    # An unauthenticated read (actor: nil) must surface as a clean error
+    # tuple — matching the KeyGrants manager — not crash the read
+    # pipeline mid-request.
+    test "read with a nil actor returns :missing_principal instead of raising", %{
+      actor: actor,
+      opts: opts
+    } do
+      dek = AshEnvelope.generate_dek()
+      {:ok, wrapped} = Asymmetric.wrap_dek(dek, write_op(actor), opts)
+
+      assert {:error, :missing_principal} = Asymmetric.unwrap_dek(wrapped, read_op(nil), opts)
+    end
+
+    test "write with a nil actor returns :missing_principal instead of raising", %{opts: opts} do
+      dek = AshEnvelope.generate_dek()
+
+      assert {:error, :missing_principal} = Asymmetric.wrap_dek(dek, write_op(nil), opts)
+    end
+
+    test "actor missing the key attribute returns :missing_principal", %{opts: opts} do
+      dek = AshEnvelope.generate_dek()
+      keyless = %{id: Ash.UUID.generate()}
+
+      assert {:error, :missing_principal} = Asymmetric.wrap_dek(dek, write_op(keyless), opts)
+
+      {pub, _priv} = AshEnvelope.generate_key_pair()
+      {:ok, wrapped} = Asymmetric.wrap_dek(dek, write_op(%{id: "w", public_key: pub}), opts)
+
+      assert {:error, :missing_principal} = Asymmetric.unwrap_dek(wrapped, read_op(keyless), opts)
+    end
+
+    test "malformed actor key material returns :invalid_actor_key", %{actor: actor, opts: opts} do
+      dek = AshEnvelope.generate_dek()
+      # Base64 of 16 bytes — decodes, but not to a 32-byte key.
+      malformed = %{id: "m", private_key: Base.encode64(:crypto.strong_rand_bytes(16))}
+
+      {:ok, wrapped} = Asymmetric.wrap_dek(dek, write_op(actor), opts)
+
+      assert {:error, :invalid_actor_key} =
+               Asymmetric.unwrap_dek(wrapped, read_op(malformed), opts)
     end
   end
 
