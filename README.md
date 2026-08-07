@@ -28,6 +28,9 @@ It uses AES-256-GCM for encryption with random IVs and authentication tags, and 
 ## Topics
 
 - [How Envelope Encryption Works](documentation/topics/how-envelope-encryption-works.md)
+- [Reconciliation](documentation/topics/reconciliation.md)
+- [Expiring Grants](documentation/topics/expiring-grants.md)
+- [User-driven fulfillment](documentation/topics/user-driven-fulfillment.md)
 
 ## Reference
 

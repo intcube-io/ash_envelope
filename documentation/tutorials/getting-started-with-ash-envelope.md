@@ -2,11 +2,19 @@
 
 ## Installation
 
-Add `ash_envelope` to your list of dependencies in `mix.exs`:
+`ash_envelope` is not on Hex yet — it depends on an unreleased branch of
+`ash_storage`, and Hex does not allow publishing packages with git
+dependencies. Until `ash_storage` ships on Hex, install `ash_envelope`
+as a git dependency in `mix.exs`:
 
 ```elixir
-{:ash_envelope, "~> 0.1.0"}
+{:ash_envelope, git: "https://github.com/intcube-io/ash_envelope.git"}
 ```
+
+This pulls in `ash_storage` as a transitive git dependency (pinned to
+the BlobIO branch `ash_envelope` tracks), so your app will also carry
+that git dependency. A regular Hex install (`{:ash_envelope, "~> ..."}`)
+will become available once `ash_storage` is released on Hex.
 
 ## What this library is for
 
@@ -32,8 +40,21 @@ one grant row per recipient. Adding / revoking recipients =
 grant-row management; the ciphertext never moves.
 
 ```elixir
+# One config struct for the grants table (see "Multi-Recipient Key
+# Grants" below for generating the resource this points at).
+defp key_grants_config do
+  %AshEnvelope.KeyGrants.Config{
+    resource: MyApp.MessageKeyGrant,
+    subject_id_attribute: :message_id,
+    actor_public_key_attribute: :encryption_public_key,
+    actor_private_key_attribute: :encryption_private_key
+  }
+end
+
 # At write time
 def create_message(attrs, sender, recipients) do
+  config = key_grants_config()
+  message_id = Ash.UUID.generate()
   dek = AshEnvelope.generate_dek()
 
   # Pass record id as :context to bind ciphertext to the row.
@@ -43,7 +64,7 @@ def create_message(attrs, sender, recipients) do
   ciphertext = AshEnvelope.encrypt(attrs.body, dek, context: to_string(message_id))
 
   {:ok, message} =
-    MyApp.Messages.create_message(%{id: message_id, body_ciphertext: ciphertext, ...})
+    MyApp.Messages.create_message(%{id: message_id, body_ciphertext: ciphertext})
 
   for recipient <- [sender | recipients] do
     AshEnvelope.KeyGrants.create_for_actor(config, message.id, dek, recipient, MyApp.Domain)
@@ -52,6 +73,8 @@ end
 
 # At read time
 def read_message(message, actor) do
+  config = key_grants_config()
+
   {:ok, dek} =
     AshEnvelope.KeyGrants.resolve_for_actor(config, message.id, actor, MyApp.Domain)
 

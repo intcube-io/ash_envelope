@@ -38,20 +38,25 @@ defmodule AshEnvelope.MixProject do
   defp docs do
     [
       main: "readme",
-      source_ref: "v#{@version}",
+      # TODO: switch back to "v#{@version}" once the repo has release tags.
+      # No tags exist yet, so a v-prefixed source_ref 404s every source link.
+      source_ref: "main",
       extra_section: "GUIDES",
       extras: [
         {"README.md", title: "Home"},
         "documentation/tutorials/getting-started-with-ash-envelope.md",
         "documentation/topics/how-envelope-encryption-works.md",
         "documentation/topics/reconciliation.md",
+        "documentation/topics/expiring-grants.md",
         "documentation/topics/user-driven-fulfillment.md",
         "documentation/proposals/reconcile-and-grant-requests.md",
+        "documentation/proposals/blob-io-convergence.md",
         "CHANGELOG.md"
       ],
       groups_for_extras: [
         Tutorials: ~r"documentation/tutorials",
         Topics: ~r"documentation/topics",
+        Proposals: ~r"documentation/proposals",
         "About AshEnvelope": [
           "CHANGELOG.md"
         ]

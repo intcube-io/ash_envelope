@@ -1,9 +1,10 @@
 # Proposal — Converging `ash_envelope` onto `ash_storage` BlobIO
 
-Status: implemented (v0.3.0). Tracks the [`blobio/06-proxy-actor-lifetime`
-branch of `wln/ash_storage`](https://github.com/wln/ash_storage/tree/blobio/06-proxy-actor-lifetime)
-(tip of the rebuilt `blobio/*` stack, successor to the original
-`blob-io-stack` branch) until BlobIO lands on `ash_storage`'s `main`.
+Status: implemented (unreleased; on `main` following the v0.1.0/0.2.0
+releases). Tracks the [`blobio5/serving-disposition`
+branch of `wln/ash_storage`](https://github.com/wln/ash_storage/tree/blobio5/serving-disposition)
+(successor to the original `blob-io-stack` branch) until BlobIO lands
+on `ash_storage`'s `main`.
 
 This proposal sketches how `ash_envelope` could stop shipping its own
 storage-wrapping service and instead express its entire storage story
