@@ -14,7 +14,7 @@ defmodule AshEnvelope.Test.Reconcile.Grant do
 
     create :create do
       primary? true
-      accept [:wrapped_dek, :document_id, :user_id]
+      accept [:wrapped_dek, :document_id, :user_id, :expires_at]
     end
 
     destroy :destroy do
@@ -42,6 +42,11 @@ defmodule AshEnvelope.Test.Reconcile.Grant do
 
     attribute :user_id, :uuid do
       allow_nil? false
+      public? true
+    end
+
+    attribute :expires_at, :utc_datetime_usec do
+      allow_nil? true
       public? true
     end
 

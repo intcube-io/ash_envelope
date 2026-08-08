@@ -197,6 +197,12 @@ defmodule AshEnvelope.Reconcile do
         doc:
           "Attribute on the grants resource holding the wrapped DEK. Defaults to `:wrapped_dek`."
       ],
+      key_grants_expires_at_attribute: [
+        type: :atom,
+        required: false,
+        doc:
+          "Nullable `utc_datetime_usec` attribute on the grants resource marking grant expiry. When set, the planner treats expired rows as absent, so reconcile destroys and re-issues them while the read policy still authorizes the principal. Defaults to `nil` (expiry disabled)."
+      ],
       actor_public_key_attribute: [
         type: :atom,
         required: false,
