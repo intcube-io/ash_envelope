@@ -72,7 +72,8 @@ defmodule AshEnvelope.GrantRequests do
   identity: if an unfulfilled request already exists for the same target
   and subject, returns `:ok` without creating a duplicate.
 
-  `requested_by_actor` may be `nil`.
+  `requested_by_actor` may be `nil`. `opts[:tenant]` is forwarded to
+  the underlying Ash calls for multitenant request resources.
 
   Returns `:ok` on success, `{:error, reason}` otherwise.
   """
@@ -89,7 +90,9 @@ defmodule AshEnvelope.GrantRequests do
   end
 
   defp do_create(config, subject_id, target_id, requested_by_actor, domain, opts) do
-    case lookup_pending(config, subject_id, target_id, domain) do
+    tenant = Keyword.get(opts, :tenant)
+
+    case lookup_pending(config, subject_id, target_id, domain, tenant) do
       {:ok, %_{}} ->
         :ok
 
@@ -107,7 +110,11 @@ defmodule AshEnvelope.GrantRequests do
             reason -> Map.put(attrs, config.reason_attribute, reason)
           end
 
-        case Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?) do
+        case Ash.create(config.resource, attrs,
+               domain: domain,
+               tenant: tenant,
+               authorize?: config.authorize?
+             ) do
           {:ok, _} ->
             :ok
 
@@ -115,7 +122,7 @@ defmodule AshEnvelope.GrantRequests do
             # A concurrent create may have won the race against the
             # `unique_pending` identity. Re-check before reporting the
             # failure so duplicate-key conflicts surface as :ok (idempotent).
-            case lookup_pending(config, subject_id, target_id, domain) do
+            case lookup_pending(config, subject_id, target_id, domain, tenant) do
               {:ok, %_{}} -> :ok
               _ -> err
             end
@@ -202,6 +209,9 @@ defmodule AshEnvelope.GrantRequests do
   Concurrent fulfillment is safe: the update conditions on
   `is_nil(fulfilled_at)`, so a second fulfiller simply gets `:ok`.
 
+  `opts[:tenant]` is forwarded to the underlying Ash calls (including
+  the `KeyGrants.share/6` re-wrap) for multitenant resources.
+
   Returns `:ok` on success or `{:error, reason}` otherwise.
   """
   @spec fulfill(
@@ -210,7 +220,8 @@ defmodule AshEnvelope.GrantRequests do
           Ash.Resource.record(),
           term(),
           term(),
-          module()
+          module(),
+          keyword()
         ) ::
           :ok | {:error, term()}
   def fulfill(
@@ -219,23 +230,36 @@ defmodule AshEnvelope.GrantRequests do
         request,
         actor,
         target_actor,
-        domain
+        domain,
+        opts \\ []
       ) do
     if Map.get(request, config.fulfilled_at_attribute) do
       :ok
     else
       subject_id = Map.get(request, config.subject_id_attribute)
+      tenant = Keyword.get(opts, :tenant)
 
-      with :ok <- KeyGrants.share(grants_config, subject_id, actor, target_actor, domain),
+      with :ok <-
+             KeyGrants.share(grants_config, subject_id, actor, target_actor, domain,
+               tenant: tenant
+             ),
            {:ok, fresh} <-
-             Ash.get(config.resource, request.id, domain: domain, authorize?: config.authorize?),
+             Ash.get(config.resource, request.id,
+               domain: domain,
+               tenant: tenant,
+               authorize?: config.authorize?
+             ),
            :ok <- ensure_pending(fresh, config) do
         attrs = %{
           config.fulfilled_at_attribute => DateTime.utc_now(),
           config.fulfilled_by_attribute => principal_id(actor)
         }
 
-        case Ash.update(fresh, attrs, domain: domain, authorize?: config.authorize?) do
+        case Ash.update(fresh, attrs,
+               domain: domain,
+               tenant: tenant,
+               authorize?: config.authorize?
+             ) do
           {:ok, _} -> :ok
           {:error, _} = err -> err
         end
@@ -311,19 +335,24 @@ defmodule AshEnvelope.GrantRequests do
 
   Used by reconciliation when a target loses authorization on a subject —
   any pending request for them on that subject is no longer relevant.
+
+  `opts[:tenant]` is forwarded to the underlying Ash calls for
+  multitenant request resources.
   """
-  @spec revoke_pending_for(Config.t(), term(), term(), module()) ::
+  @spec revoke_pending_for(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, non_neg_integer()} | {:error, term()}
-  def revoke_pending_for(%Config{} = config, subject_id, target_id, domain) do
+  def revoke_pending_for(%Config{} = config, subject_id, target_id, domain, opts \\ []) do
+    tenant = Keyword.get(opts, :tenant)
+
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
-    |> Ash.read(domain: domain, authorize?: config.authorize?)
+    |> Ash.read(domain: domain, tenant: tenant, authorize?: config.authorize?)
     |> case do
       {:ok, requests} ->
         Enum.reduce(requests, {:ok, 0}, fn req, {:ok, count} ->
-          case Ash.destroy(req, domain: domain, authorize?: config.authorize?) do
+          case Ash.destroy(req, domain: domain, tenant: tenant, authorize?: config.authorize?) do
             :ok -> {:ok, count + 1}
             {:ok, _} -> {:ok, count + 1}
             {:error, _} = err -> err
@@ -337,13 +366,13 @@ defmodule AshEnvelope.GrantRequests do
 
   # ---- private ----
 
-  defp lookup_pending(config, subject_id, target_id, domain) do
+  defp lookup_pending(config, subject_id, target_id, domain, tenant) do
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
     |> Ash.Query.limit(1)
-    |> Ash.read(domain: domain, authorize?: config.authorize?)
+    |> Ash.read(domain: domain, tenant: tenant, authorize?: config.authorize?)
     |> case do
       {:ok, [row | _]} -> {:ok, row}
       {:ok, []} -> {:ok, nil}

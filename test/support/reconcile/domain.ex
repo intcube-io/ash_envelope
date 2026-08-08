@@ -8,6 +8,8 @@ defmodule AshEnvelope.Test.Reconcile.Domain do
     resource AshEnvelope.Test.Reconcile.DocumentWithAffects
     resource AshEnvelope.Test.Reconcile.Membership
     resource AshEnvelope.Test.Reconcile.AffectingMembership
+    resource AshEnvelope.Test.Reconcile.MtDocument
+    resource AshEnvelope.Test.Reconcile.MtMembership
     resource AshEnvelope.Test.Reconcile.Grant
     resource AshEnvelope.Test.Reconcile.GrantRequest
   end

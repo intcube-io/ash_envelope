@@ -185,6 +185,27 @@ Default chain is `[:actor, :request]`. Tuple-form strategies accept a
 `:when` predicate (`(target, ctx) -> boolean`) to gate which targets
 they fire for — see the moduledoc for `AshEnvelope.Reconcile.Granter`.
 
+## Multitenancy
+
+The tenant of the triggering changeset is captured into the reconcile
+`Context` and propagated everywhere the subsystem touches Ash:
+
+- subject enumeration (`SyncPrincipal`'s `scope`, including `:all`) and
+  `SyncSubject`'s candidate stream;
+- the `Ash.can?({subject, :read}, principal)` truth check;
+- all reads and writes against the user, encrypted, key-grants, and
+  grant-requests resources (via a `tenant:` option on the
+  `AshEnvelope.KeyGrants` / `AshEnvelope.GrantRequests` calls);
+- `:async` mode job args — the trigger serializes the tenant with
+  `Ash.ToTenant.to_tenant/2` and `AsyncWorker` restores it before
+  rebuilding the run. Context-multitenancy hosts must use a tenant
+  value that survives a JSON round-trip (string/integer).
+
+A `nil` tenant (single-tenant hosts) is passed through unchanged, so
+behavior is identical to previous releases. When calling `Runner.plan/2`
+or `Runner.apply_plan!/3` directly (e.g. the preview flow below), set
+`ctx.tenant` yourself alongside `ctx.actor`.
+
 ## Preview & confirm
 
 By default reconciliation fires in `after_transaction` and writes

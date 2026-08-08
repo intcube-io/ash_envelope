@@ -66,6 +66,8 @@ defmodule AshEnvelope.KeyGrants do
 
   `opts[:expires_at]` accepts a `DateTime` to make the grant
   time-bounded; requires `Config.expires_at_attribute` to be set.
+  `opts[:tenant]` is forwarded to the underlying Ash call for
+  multitenant grants resources.
 
   Returns `:ok` on success or `{:error, reason}` on failure.
   """
@@ -88,7 +90,11 @@ defmodule AshEnvelope.KeyGrants do
 
         attrs = maybe_put_expires_at(attrs, config, Keyword.get(opts, :expires_at))
 
-        case Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?) do
+        case Ash.create(config.resource, attrs,
+               domain: domain,
+               tenant: Keyword.get(opts, :tenant),
+               authorize?: config.authorize?
+             ) do
           {:ok, _} -> :ok
           {:error, _} = err -> err
         end
@@ -102,13 +108,16 @@ defmodule AshEnvelope.KeyGrants do
   past their deadline are treated as if they don't exist
   (`{:error, :not_found}`).
 
+  `opts[:tenant]` is forwarded to the underlying Ash call for
+  multitenant grants resources.
+
   Returns `{:ok, raw_dek}` (32-byte binary) or `{:error, :not_found}`.
   """
-  @spec resolve_for_actor(Config.t(), term(), term(), module()) ::
+  @spec resolve_for_actor(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, binary()}
           | {:error,
              :not_found | :corrupted_dek | :decryption_failed | :missing_principal | term()}
-  def resolve_for_actor(%Config{} = config, subject_id, actor, domain) do
+  def resolve_for_actor(%Config{} = config, subject_id, actor, domain, opts \\ []) do
     case principal_id(actor) do
       nil ->
         {:error, :missing_principal}
@@ -120,7 +129,12 @@ defmodule AshEnvelope.KeyGrants do
           |> Ash.Query.filter(^[{config.principal_id_attribute, pid}])
           |> Ash.Query.select(select_user_grant(config))
 
-        with {:ok, [grant | _]} <- Ash.read(query, domain: domain, authorize?: config.authorize?),
+        with {:ok, [grant | _]} <-
+               Ash.read(query,
+                 domain: domain,
+                 tenant: Keyword.get(opts, :tenant),
+                 authorize?: config.authorize?
+               ),
              :ok <- check_not_expired(grant, config),
              {:ok, decoded} <- Base.decode64(Map.get(grant, config.dek_attribute)) do
           AshEnvelope.unwrap_dek(
@@ -145,15 +159,18 @@ defmodule AshEnvelope.KeyGrants do
   without creating a duplicate.
 
   `opts[:expires_at]` is forwarded to `create_for_actor/6` if the
-  target needs a fresh grant.
+  target needs a fresh grant. `opts[:tenant]` is forwarded to both the
+  grant lookups and the grant create.
 
   Returns `:ok` or `{:error, reason}`.
   """
   @spec share(Config.t(), term(), term(), term(), module(), keyword()) ::
           :ok | {:error, term()}
   def share(%Config{} = config, subject_id, actor, target_actor, domain, opts \\ []) do
-    with {:ok, raw_dek} <- resolve_for_actor(config, subject_id, actor, domain) do
-      case resolve_for_actor(config, subject_id, target_actor, domain) do
+    resolve_opts = Keyword.take(opts, [:tenant])
+
+    with {:ok, raw_dek} <- resolve_for_actor(config, subject_id, actor, domain, resolve_opts) do
+      case resolve_for_actor(config, subject_id, target_actor, domain, resolve_opts) do
         {:ok, _} ->
           :ok
 
@@ -172,7 +189,8 @@ defmodule AshEnvelope.KeyGrants do
   **Authorization:** Defaults to `authorize?: true`. The grants resource's
   Ash policies decide whether the caller may revoke. Pass
   `authorize?: false` only for trusted system paths (e.g. reconciliation
-  workers running with no actor).
+  workers running with no actor). `opts[:tenant]` is forwarded to the
+  underlying Ash call for multitenant grants resources.
   """
   @spec revoke(Ash.Resource.record(), module(), keyword()) :: :ok | {:error, term()}
   def revoke(grant_record, domain, opts \\ []) do
@@ -181,6 +199,7 @@ defmodule AshEnvelope.KeyGrants do
     Ash.destroy(grant_record,
       domain: domain,
       actor: actor,
+      tenant: Keyword.get(opts, :tenant),
       authorize?: Keyword.get(opts, :authorize?, true)
     )
   end
