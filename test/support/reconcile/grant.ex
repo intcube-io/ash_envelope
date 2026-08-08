@@ -10,11 +10,20 @@ defmodule AshEnvelope.Test.Reconcile.Grant do
   end
 
   actions do
-    defaults [:read, :destroy]
+    defaults [:read]
 
     create :create do
       primary? true
       accept [:wrapped_dek, :document_id, :user_id]
+    end
+
+    destroy :destroy do
+      primary? true
+
+      # Failure injection for the reconcile error-surfacing tests — a
+      # no-op unless the test process sets the pdict flag the change
+      # reads. See `AshEnvelope.Test.Reconcile.FailGrantDestroy`.
+      change AshEnvelope.Test.Reconcile.FailGrantDestroy
     end
   end
 

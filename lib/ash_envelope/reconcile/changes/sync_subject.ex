@@ -66,7 +66,20 @@ defmodule AshEnvelope.Reconcile.Changes.SyncSubject do
     case candidates(ctx, subject, opts) do
       {:ok, candidate_ids} ->
         pairs = Enum.map(candidate_ids, &{&1, subject})
-        Runner.run(ctx, pairs)
+
+        # Best-effort: the host's write has already committed by the time
+        # this after_transaction hook runs, so a reconcile failure must not
+        # turn the successful result into an error. Log the aggregate.
+        case Runner.run(ctx, pairs) do
+          :ok ->
+            :ok
+
+          {:error, aggregate} ->
+            Logger.warning(
+              "[AshEnvelope.Reconcile.SyncSubject] reconcile completed with failures: #{inspect(aggregate)}"
+            )
+        end
+
         result
 
       {:error, reason} ->

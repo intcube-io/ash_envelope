@@ -354,6 +354,101 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
     end
   end
 
+  describe "failure surfacing" do
+    test "a grant failure surfaces in run's return value" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      # An unknown strategy makes the granter chain error terminally —
+      # the same propagation path as a flaky Ash.create inside a granter.
+      ctx = build_context(actor, granter_chain: [:bogus_strategy])
+
+      log =
+        capture_log(fn ->
+          assert {:error, %{grant_failures: [failure], revoke_failures: [], plan_errors: []}} =
+                   Runner.run(ctx, [{target.id, doc.id}])
+
+          assert failure == {target.id, doc.id, {:unknown_strategy, :bogus_strategy}}
+        end)
+
+      assert log =~ "grant issuance failed"
+    end
+
+    test "a revoke failure surfaces in run's return value" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+
+      # Unauthorized grant (no membership) → the planner wants a revocation.
+      dek = AshEnvelope.generate_dek()
+      :ok = KeyGrants.create_for_actor(grants_config(), doc.id, dek, target, @domain)
+
+      ctx = build_context(actor)
+      Process.put(:ash_envelope_fail_grant_destroy, true)
+
+      log =
+        capture_log(fn ->
+          assert {:error,
+                  %{
+                    grant_failures: [],
+                    revoke_failures: [{principal_id, subject_id, _reason}],
+                    plan_errors: []
+                  }} = Runner.run(ctx, [{target.id, doc.id}])
+
+          assert principal_id == target.id
+          assert subject_id == doc.id
+        end)
+
+      Process.delete(:ash_envelope_fail_grant_destroy)
+
+      assert log =~ "revoke failed"
+      # The de-authorized grant is still live — the caller MUST see the
+      # error, because nothing else retries a failed revocation in sync mode.
+      assert {:ok, %_{}} = grant_for(target, doc)
+
+      # A clean retry revokes it.
+      assert :ok = Runner.run(ctx, [{target.id, doc.id}])
+      assert {:ok, nil} = grant_for(target, doc)
+    end
+
+    test "planner Plan.errors surface in run's return value" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      missing_subject_id = Ash.UUID.generate()
+
+      ctx = build_context(actor)
+
+      assert {:error,
+              %{grant_failures: [], revoke_failures: [], plan_errors: [{principal_id, _reason}]}} =
+               Runner.run(ctx, [{target.id, missing_subject_id}])
+
+      assert principal_id == target.id
+    end
+
+    test "exhausted granter chain (:skip) is logged but not a failure" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      # `:actor` skips (actor holds no grant); a never-matching `:request`
+      # `when:` filter skips too — chain exhausted, still `:ok`.
+      ctx =
+        build_context(actor,
+          granter_chain: [:actor, {:request, when: fn _target -> false end}]
+        )
+
+      log =
+        capture_log(fn ->
+          assert :ok = Runner.run(ctx, [{target.id, doc.id}])
+        end)
+
+      assert log =~ "chain exhausted"
+    end
+  end
+
   # SR8: lock the reconciliation correctness invariants beyond the example
   # tests above. We sample the four-cell truth table at random across many
   # principals, and we assert the wrap-binding invariant on the apply side:

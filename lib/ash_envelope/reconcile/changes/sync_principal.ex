@@ -157,8 +157,20 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     end
   end
 
+  # Best-effort: the host's write has already committed by the time this
+  # after_transaction hook runs, so a reconcile failure must not turn the
+  # successful result into an error. Log the aggregate and move on.
   defp execute(:sync, ctx, pairs, result) do
-    Runner.run(ctx, pairs)
+    case Runner.run(ctx, pairs) do
+      :ok ->
+        :ok
+
+      {:error, aggregate} ->
+        Logger.warning(
+          "[AshEnvelope.Reconcile.SyncPrincipal] reconcile completed with failures: #{inspect(aggregate)}"
+        )
+    end
+
     result
   end
 

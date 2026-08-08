@@ -212,6 +212,34 @@ On confirm: `AshEnvelope.Reconcile.Runner.apply_plan!(ctx, plan)`.
 the batch is atomic across the grant inserts/deletes. Pass
 `transaction: false` if you've already opened a transaction yourself.
 
+### Return value
+
+`Runner.run/3` and `Runner.apply_plan!/3` return `:ok` only when every
+planned grant and revocation applied cleanly. Otherwise they return
+`{:error, aggregate}` where `aggregate` is a map with:
+
+- `:grant_failures` — `[{principal_id, subject_id, reason}]` for grant
+  entries whose granter chain errored,
+- `:revoke_failures` — `[{principal_id, subject_id, reason}]` for
+  revocations that failed (grant read, grant destroy, or pending-request
+  cleanup),
+- `:plan_errors` — `[{principal_id, reason}]` carried over from
+  `Plan.errors` (pairs that errored during planning).
+
+An exhausted granter chain (every strategy returned `:skip`) is logged
+but not counted as a failure.
+
+How a failure surfaces depends on where reconciliation runs:
+
+- **`:sync` mode** — the change modules fire in `after_transaction`,
+  after the host write has committed, so they log the aggregate at
+  `:warning` and return the host action's original result (best-effort).
+  Call `Runner.run/3` directly when you need to handle the aggregate.
+- **`:async` mode** — `AsyncWorker.perform/1` returns the aggregate to
+  Oban, which retries the job with backoff (up to 5 attempts).
+  Reconciliation is idempotent, so retries only re-attempt the
+  still-failing pairs.
+
 Caveats:
 
 - The plan can go stale. If the world has changed between `plan/2`
