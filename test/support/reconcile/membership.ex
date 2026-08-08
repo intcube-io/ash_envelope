@@ -61,7 +61,42 @@ defmodule AshEnvelope.Test.Reconcile.Membership do
          encrypted_resource: AshEnvelope.Test.Reconcile.DocumentWithAffects, mode: :async}
       )
     end
+
+    # Explicit-form action whose scope resolves to an empty list. Used to
+    # assert that `[]` means "no subjects" (a no-op) rather than an empty
+    # keyword filter that would fan out over the entire table.
+    create :empty_scope_create do
+      accept [:user_id, :document_id]
+
+      change(
+        {AshEnvelope.Reconcile.Changes.SyncPrincipal,
+         encrypted_resource: AshEnvelope.Test.Reconcile.DocumentWithAffects,
+         principal: :user_id,
+         scope: &__MODULE__.empty_scope/1}
+      )
+    end
+
+    # Explicit-form async action whose scope returns bare subject ids
+    # (not records, not a keyword filter). Used to assert the async
+    # trigger builds job args from bare ids without crashing.
+    create :async_create_bare_ids do
+      accept [:user_id, :document_id]
+
+      change(
+        {AshEnvelope.Reconcile.Changes.SyncPrincipal,
+         encrypted_resource: AshEnvelope.Test.Reconcile.DocumentWithAffects,
+         principal: :user_id,
+         scope: &__MODULE__.bare_ids_scope/1,
+         mode: :async}
+      )
+    end
   end
+
+  @doc false
+  def empty_scope(_cs), do: []
+
+  @doc false
+  def bare_ids_scope(cs), do: [Ash.Changeset.get_attribute(cs, :document_id)]
 
   attributes do
     uuid_primary_key :id

@@ -88,7 +88,12 @@ defmodule AshEnvelope.Reconcile do
 
   `domain`, `key_grants_resource`, `actor_public_key_attribute`, and
   `actor_private_key_attribute` are required and must be set in
-  `reconcile do`. Compile-time validation is performed by
+  `reconcile do`. `grant_requests_resource` is additionally required
+  whenever `:request` appears in the effective `granter_chain` — and the
+  *default* chain is `[:actor, :request]`, so a minimal config must
+  either set it or narrow the chain (e.g. `granter_chain [:actor]`).
+  Compile-time validation (including granter-chain entry shapes and the
+  Oban dependency for `mode :async`) is performed by
   `AshEnvelope.Reconcile.Transformers.ValidateConfig`.
 
   When the encrypted resource is an `AshStorage` attachment using
@@ -242,7 +247,7 @@ defmodule AshEnvelope.Reconcile do
         type: {:in, [:sync, :async]},
         default: :sync,
         doc:
-          "`:sync` (default) — change modules apply reconciliation in `after_transaction`. `:async` — `SyncPrincipal` resolves the scope inline (cheap SELECT) and enqueues an Oban job carrying subject ids + principal id + actor id (no key material) so the rewrap work happens off-request. Requires `:oban` to be available. May also be overridden per change via the `mode:` option."
+          "`:sync` (default) — change modules apply reconciliation in `after_transaction`. `:async` — `SyncPrincipal` resolves the scope inline (cheap SELECT) and inserts an Oban job carrying subject ids + principal id + actor id (no key material) in `after_action`, inside the triggering transaction, so the job commits atomically with the write and the rewrap work happens off-request. Requires `:oban` to be available. May also be overridden per change via the `mode:` option."
       ],
       oban_queue: [
         type: :atom,
@@ -255,6 +260,12 @@ defmodule AshEnvelope.Reconcile do
         default: 5000,
         doc:
           "When `:async` mode resolves a scope to more than this many subject ids, the trigger splits them across multiple Oban jobs. Default 5000."
+      ],
+      oban_name: [
+        type: :atom,
+        default: Oban,
+        doc:
+          "Name of the Oban instance `:async` mode jobs are inserted into (first argument to `Oban.insert!/2`). Default `Oban`. Set this when the host supervises Oban under a custom name."
       ]
     ]
   }

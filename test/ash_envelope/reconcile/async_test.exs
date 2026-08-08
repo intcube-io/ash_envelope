@@ -2,7 +2,7 @@ defmodule AshEnvelope.Reconcile.AsyncTest do
   # Not async: mutates Application env for the enqueuer hook.
   use ExUnit.Case, async: false
 
-  alias AshEnvelope.{KeyGrants}
+  alias AshEnvelope.KeyGrants
 
   alias AshEnvelope.Test.Reconcile.{
     DocumentWithAffects,
@@ -115,6 +115,30 @@ defmodule AshEnvelope.Reconcile.AsyncTest do
       serialized = inspect(args)
       refute String.contains?(serialized, Base.encode64(actor.private_key))
       refute String.contains?(serialized, Base.encode64(actor.public_key))
+    end
+
+    # The `affects` scope docs allow a scope function to return a bare
+    # list of subject ids. The async trigger used to `Map.get/2` each
+    # element (BadMapError post-commit, silently losing reconciliation);
+    # it must build job args from bare ids just like the sync path does.
+    test "scope returning bare subject ids enqueues job args from those ids" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+
+      {:ok, _membership} =
+        Ash.create(
+          Membership,
+          %{user_id: target.id, document_id: doc.id},
+          action: :async_create_bare_ids,
+          actor: actor,
+          domain: @domain
+        )
+
+      assert_received {:enqueued, args, :ash_envelope_reconcile}
+      assert args["principal_id"] == target.id
+      assert args["actor_id"] == actor.id
+      assert args["subject_ids"] == [doc.id]
     end
   end
 

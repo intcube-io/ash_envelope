@@ -19,9 +19,21 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     user resource itself).
   - `:scope` *(optional)* — either `:all` (every encrypted record) or
     a `(Ash.Changeset.t() -> Ash.Query.t() | keyword() | [term()])` filter.
+    A function returning a keyword list filters the encrypted resource; a
+    bare list is treated as subject ids. An empty list means "no
+    subjects" and the change is a no-op.
   - `:only_when` *(optional)* — `(Ash.Changeset.t() -> boolean())`. When
     it returns `false`, the change is a no-op. Useful for `User.update`
     actions that only matter when a specific attribute changes.
+
+  ## Hook timing
+
+  In `:sync` mode reconciliation runs in `after_transaction`, post-commit
+  — the fan-out (policy checks + grant writes) shouldn't hold the
+  triggering transaction open. In `:async` mode the scope is resolved and
+  the Oban job inserted in `after_action`, *inside* the transaction, so
+  the job commits (or rolls back) atomically with the triggering write —
+  a crash after commit can't silently drop the reconciliation.
 
   ## Lookup form (preferred)
 
@@ -74,13 +86,30 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
   @impl true
   def change(changeset, opts, _context) do
-    Ash.Changeset.after_transaction(changeset, fn cs, result ->
-      case result do
-        {:ok, _} -> maybe_run(cs, opts, result)
-        :ok -> maybe_run(cs, opts, result)
-        _ -> result
-      end
-    end)
+    encrypted = Keyword.fetch!(opts, :encrypted_resource)
+
+    case Mode.resolve(opts, encrypted) do
+      :async ->
+        # Enqueue inside the action's transaction (`after_action`) rather
+        # than post-commit (`after_transaction`): a crash between commit
+        # and `Oban.insert!` would otherwise lose the reconciliation
+        # permanently. With the standard setup (Oban sharing the
+        # resource's repo) the job row commits atomically with the
+        # triggering write; a failed insert rolls the write back.
+        Ash.Changeset.after_action(changeset, fn cs, record ->
+          maybe_run(cs, opts, {:ok, record})
+          {:ok, record}
+        end)
+
+      :sync ->
+        Ash.Changeset.after_transaction(changeset, fn cs, result ->
+          case result do
+            {:ok, _} -> maybe_run(cs, opts, result)
+            :ok -> maybe_run(cs, opts, result)
+            _ -> result
+          end
+        end)
+    end
   end
 
   defp maybe_run(cs, opts, result) do
@@ -181,13 +210,14 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     encrypted = ctx.encrypted_resource
     queue = ok_or(Info.reconcile_oban_queue(encrypted), :ash_envelope_reconcile)
     chunk_size = ok_or(Info.reconcile_oban_chunk_size(encrypted), 5000)
+    oban_name = ok_or(Info.reconcile_oban_name(encrypted), Oban)
     actor_id = ctx.actor && Map.get(ctx.actor, :id)
 
     # Pairs may now span multiple principals (e.g. an `:update` that
     # reassigns the FK reconciles both old and new). Group by principal_id
     # so each Oban job carries one principal + its subject ids.
     pairs
-    |> Enum.group_by(fn {pid, _} -> pid end, fn {_, subject} -> Map.get(subject, :id) end)
+    |> Enum.group_by(fn {pid, _} -> pid end, fn {_, subject} -> subject_id(subject) end)
     |> Enum.each(fn {principal_id, subject_ids} ->
       subject_ids
       |> Enum.reject(&is_nil/1)
@@ -200,24 +230,30 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
           "subject_ids" => chunk
         }
 
-        enqueue(args, queue)
+        enqueue(args, queue, oban_name)
       end)
     end)
 
     :ok
   end
 
+  # Scope functions may return loaded records *or* bare subject ids (the
+  # `affects` scope docs allow both, and the sync path handles either via
+  # `Runner.load_subject/2`). Mirror that here when building job args.
+  defp subject_id(subject) when is_map(subject), do: Map.get(subject, :id)
+  defp subject_id(id), do: id
+
   # Test hook: a 2-arity function `(args, queue) -> any` registered under
   # `Application.get_env(:ash_envelope, :reconcile_async_enqueuer)` is
-  # called instead of `Oban.insert!/1`. Used by the test suite to capture
+  # called instead of `Oban.insert!/2`. Used by the test suite to capture
   # enqueued jobs without standing up Oban + Postgres. In production this
-  # falls through to `Oban.insert!/1`.
-  defp enqueue(args, queue) do
+  # falls through to `Oban.insert!/2` against the instance configured via
+  # `reconcile do oban_name end` (default `Oban`).
+  defp enqueue(args, queue, oban_name) do
     case Application.get_env(:ash_envelope, :reconcile_async_enqueuer) do
       nil ->
-        args
-        |> AshEnvelope.Reconcile.AsyncWorker.new(queue: queue)
-        |> Oban.insert!()
+        changeset = AshEnvelope.Reconcile.AsyncWorker.new(args, queue: queue)
+        Oban.insert!(oban_name, changeset)
 
       fun when is_function(fun, 2) ->
         fun.(args, queue)
@@ -235,6 +271,12 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
   defp enumerate_subjects(_ctx, scope, _cs),
     do: {:error, {:unsupported_scope, scope}}
+
+  # `Keyword.keyword?([])` is true, so without this clause an empty list
+  # would fall through below as an empty keyword filter and match the
+  # ENTIRE table — fanning reconciliation out over every subject. A scope
+  # resolving to `[]` means "no subjects": do nothing.
+  defp enumerate_filter_result(_ctx, []), do: {:ok, []}
 
   defp enumerate_filter_result(ctx, list) when is_list(list) do
     if Keyword.keyword?(list) do
