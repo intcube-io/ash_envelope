@@ -18,6 +18,9 @@ defmodule AshEnvelope.Reconcile.Plan do
     longer authorizes. Each entry: `%{principal_id, subject_id}`.
   - `:errors` — `[{principal_id, reason}]` from pairs that errored out
     during planning (subject missing, principal missing, etc.).
+    `Runner.apply_plan!/3` folds these into its return value as
+    `:plan_errors`, so a plan that only carries errors still yields
+    `{:error, aggregate}` at apply time.
   """
 
   defstruct grants: [],

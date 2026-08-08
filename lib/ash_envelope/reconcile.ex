@@ -78,6 +78,26 @@ defmodule AshEnvelope.Reconcile do
   - `:request` — write a pending row to `grant_requests_resource`,
     fulfilled later by an authorized user.
 
+  ## Failure surfacing
+
+  `Runner.run/3` and `Runner.apply_plan!/3` return `:ok` only when
+  every planned grant/revocation applied cleanly; otherwise they return
+  `{:error, aggregate}` where `aggregate` collects `:grant_failures`,
+  `:revoke_failures`, and `:plan_errors` (see
+  `t:AshEnvelope.Reconcile.Runner.apply_error/0`). How that surfaces
+  depends on the mode:
+
+  - **`:sync`** — the change modules run reconciliation in
+    `after_transaction`, *after* the host write has committed, so a
+    reconcile failure never turns the successful write into an error.
+    The aggregate is logged at `:warning` and the original result is
+    returned. Call `Runner.run/3` directly when you need to react to
+    the return value programmatically.
+  - **`:async`** — `AsyncWorker.perform/1` returns the aggregate to
+    Oban, which retries the job with backoff (up to 5 attempts).
+    Reconciliation is idempotent, so each retry only re-attempts the
+    still-failing pairs.
+
   Future work (tracked in
   [the design proposal](../proposals/reconcile-and-grant-requests.md)):
   auto-derive an `affects` plan from the encrypted resource's read

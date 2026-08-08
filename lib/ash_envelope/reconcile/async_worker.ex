@@ -29,6 +29,14 @@ if Code.ensure_loaded?(Oban) do
     Idempotent: `Runner.run/2` checks `grant_exists?` and the request
     table's `is_nil(fulfilled_at)` guard before issuing, so retries skip
     completed pairs.
+
+    Failure handling: when `Runner.run/2` reports that any pair failed
+    to apply (a grant issuance or revocation errored), `perform/1`
+    returns `{:error, aggregate}` so Oban retries the job with backoff,
+    up to `max_attempts: 5`. Combined with idempotency, each retry only
+    re-attempts the still-failing pairs. Permanently broken jobs
+    (unknown `encrypted_resource` module in the args) are discarded
+    instead of retried.
     """
     use Oban.Worker, max_attempts: 5
 
@@ -54,19 +62,35 @@ if Code.ensure_loaded?(Oban) do
     defp dispatch_perform({:ok, encrypted}, args), do: run_perform(encrypted, args)
 
     defp run_perform(encrypted, args) do
-      with {:ok, base_ctx} <- Info.context(encrypted) do
-        actor = load_actor_arg(base_ctx, args["actor_id"])
-        principal_id = cast_id(encrypted, args["principal_id"])
-        subject_ids = Enum.map(args["subject_ids"] || [], &cast_id(encrypted, &1))
+      case Info.context(encrypted) do
+        {:ok, base_ctx} ->
+          actor = load_actor_arg(base_ctx, args["actor_id"])
+          principal_id = cast_id(encrypted, args["principal_id"])
+          subject_ids = Enum.map(args["subject_ids"] || [], &cast_id(encrypted, &1))
 
-        ctx = %{base_ctx | actor: actor}
-        pairs = Enum.map(subject_ids, &{principal_id, &1})
-        Runner.run(ctx, pairs)
-        :ok
-      else
+          ctx = %{base_ctx | actor: actor}
+          pairs = Enum.map(subject_ids, &{principal_id, &1})
+          run_and_report(ctx, pairs)
+
         {:error, reason} ->
           Logger.warning("[AshEnvelope.Reconcile.AsyncWorker] aborting: #{inspect(reason)}")
           {:error, reason}
+      end
+    end
+
+    defp run_and_report(ctx, pairs) do
+      case Runner.run(ctx, pairs) do
+        :ok ->
+          :ok
+
+        {:error, aggregate} ->
+          # Return the aggregate so Oban retries (idempotent — only the
+          # still-failing pairs are re-attempted on the next attempt).
+          Logger.warning(
+            "[AshEnvelope.Reconcile.AsyncWorker] reconcile completed with failures, will retry: #{inspect(aggregate)}"
+          )
+
+          {:error, aggregate}
       end
     end
 

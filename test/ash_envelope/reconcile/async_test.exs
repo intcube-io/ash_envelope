@@ -2,6 +2,8 @@ defmodule AshEnvelope.Reconcile.AsyncTest do
   # Not async: mutates Application env for the enqueuer hook.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias AshEnvelope.KeyGrants
 
   alias AshEnvelope.Test.Reconcile.{
@@ -187,6 +189,41 @@ defmodule AshEnvelope.Reconcile.AsyncTest do
       # No actor → :actor strategy skipped, :request fallback fires.
       assert {:ok, nil} = grant_for(target, doc)
       assert {:ok, %_{}} = pending_request_for(target, doc)
+    end
+
+    test "returns {:error, aggregate} when a pair fails, so Oban retries" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+
+      # Unauthorized grant (no membership) → the worker plans a revocation.
+      dek = AshEnvelope.generate_dek()
+      :ok = KeyGrants.create_for_actor(grants_config(), doc.id, dek, target, @domain)
+
+      args = %{
+        "encrypted_resource" => "Elixir.AshEnvelope.Test.Reconcile.DocumentWithAffects",
+        "principal_id" => target.id,
+        "actor_id" => actor.id,
+        "subject_ids" => [doc.id]
+      }
+
+      Process.put(:ash_envelope_fail_grant_destroy, true)
+
+      log =
+        capture_log(fn ->
+          assert {:error, %{revoke_failures: [{_principal_id, _subject_id, _reason}]}} =
+                   AsyncWorker.perform(%Oban.Job{args: args})
+        end)
+
+      Process.delete(:ash_envelope_fail_grant_destroy)
+
+      assert log =~ "will retry"
+      # The failed revocation left the grant in place...
+      assert {:ok, %_{}} = grant_for(target, doc)
+
+      # ...and the retry Oban would schedule succeeds (idempotent).
+      assert :ok = AsyncWorker.perform(%Oban.Job{args: args})
+      assert {:ok, nil} = grant_for(target, doc)
     end
 
     test "unknown encrypted_resource module → discards (no retries)" do

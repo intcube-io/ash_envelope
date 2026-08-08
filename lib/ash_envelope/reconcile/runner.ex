@@ -23,10 +23,13 @@ defmodule AshEnvelope.Reconcile.Runner do
   `& &1.id` by default). This lets grants live on a related row (e.g.
   an attachment blob) rather than the encrypted resource itself.
 
-  Errors are collected per pair into `Plan.errors`, never raised.
-  Granter-chain failures during apply are logged and skipped, not
-  fatal — wrap in `Ash.transaction/3` yourself if you need stricter
-  semantics.
+  Planning errors are collected per pair into `Plan.errors`, never
+  raised. Apply-side failures (granter-chain errors, failed revokes)
+  are logged *and* aggregated: `run/3` and `apply_plan!/3` return
+  `:ok` only when every entry succeeded, otherwise
+  `{:error, aggregate}` (see `t:apply_error/0`) so callers can react
+  — retry, alert, or fail the surrounding job. Exhausted granter
+  chains (`:skip`) are logged but not treated as failures.
   """
 
   alias AshEnvelope.{GrantRequests, KeyGrants}
@@ -35,12 +38,31 @@ defmodule AshEnvelope.Reconcile.Runner do
   require Ash.Query
   require Logger
 
+  @typedoc """
+  Aggregate failure report returned by `run/3` and `apply_plan!/3`.
+
+  - `:grant_failures` — `[{principal_id, subject_id, reason}]` for
+    grant entries whose granter chain returned `{:error, reason}`.
+  - `:revoke_failures` — `[{principal_id, subject_id, reason}]` for
+    revocation entries where reading the grant rows, destroying a
+    grant, or clearing a pending grant request failed.
+  - `:plan_errors` — `[{principal_id, reason}]` carried over from
+    `Plan.errors` (pairs that errored during planning).
+  """
+  @type apply_error :: %{
+          grant_failures: [{term(), term(), term()}],
+          revoke_failures: [{term(), term(), term()}],
+          plan_errors: [{term(), term()}]
+        }
+
   @doc """
   Convenience: `apply_plan!(ctx, plan(ctx, pairs), opts)`.
 
-  Same defaults as `apply_plan!/3` (`transaction: true`).
+  Same defaults and return contract as `apply_plan!/3`
+  (`transaction: true`; `:ok` or `{:error, aggregate}`).
   """
-  @spec run(Context.t(), [{term(), Ash.Resource.record() | term()}], keyword()) :: :ok
+  @spec run(Context.t(), [{term(), Ash.Resource.record() | term()}], keyword()) ::
+          :ok | {:error, apply_error()}
   def run(%Context{} = ctx, pairs, opts \\ []) when is_list(pairs) do
     plan = plan(ctx, pairs)
     apply_plan!(ctx, plan, opts)
@@ -196,44 +218,62 @@ defmodule AshEnvelope.Reconcile.Runner do
     failure mid-apply rolls back the whole batch. Default `true`.
 
   Granter-chain failures (`{:error, _}`) and exhausted chains
-  (`:skip`) are logged at `:warning` and continue with the next
-  entry — they don't trigger a rollback unless you wrap an explicit
-  raise around them. The transaction guard is there to protect
-  against unexpected exceptions inside the apply phase, not to
+  (`:skip`) are logged at `:warning` and the apply continues with the
+  next entry — they don't trigger a rollback unless you wrap an
+  explicit raise around them. The transaction guard is there to
+  protect against unexpected exceptions inside the apply phase, not to
   enforce all-grants-or-no-grants semantics across granter strategies.
 
-  Returns `:ok` unconditionally.
+  Returns `:ok` when every entry applied cleanly (exhausted chains
+  count as non-failures) and the plan carried no planning errors.
+  Otherwise returns `{:error, aggregate}` where `aggregate` is a
+  `t:apply_error/0` map collecting `:grant_failures`,
+  `:revoke_failures`, and the plan's `:errors` as `:plan_errors`.
   """
-  @spec apply_plan!(Context.t(), Plan.t(), keyword()) :: :ok
+  @spec apply_plan!(Context.t(), Plan.t(), keyword()) :: :ok | {:error, apply_error()}
   def apply_plan!(%Context{} = ctx, %Plan{} = plan, opts \\ []) do
     if Plan.empty?(plan) do
-      :ok
+      aggregate(plan, [], [])
     else
       do_apply = fn ->
-        Enum.each(plan.grants, &issue_grant_entry(ctx, &1))
-        Enum.each(plan.revocations, &revoke_entry(ctx, &1))
-        :ok
+        grant_failures = Enum.flat_map(plan.grants, &issue_grant_entry(ctx, &1))
+        revoke_failures = Enum.flat_map(plan.revocations, &revoke_entry(ctx, &1))
+        {grant_failures, revoke_failures}
       end
 
-      if Keyword.get(opts, :transaction, true) do
-        # Only the grants and grant_requests resources are written here.
-        # Excluding `encrypted_resource` avoids requiring it to share a
-        # repo/data layer with the grants table — the planner has already
-        # finished its reads.
-        case Ash.transaction(
-               tap_with_requests([ctx.key_grants_config.resource], ctx),
-               fn -> do_apply.() end
-             ) do
-          {:ok, _} ->
-            :ok
+      {grant_failures, revoke_failures} =
+        if Keyword.get(opts, :transaction, true) do
+          # Only the grants and grant_requests resources are written here.
+          # Excluding `encrypted_resource` avoids requiring it to share a
+          # repo/data layer with the grants table — the planner has already
+          # finished its reads.
+          case Ash.transaction(
+                 tap_with_requests([ctx.key_grants_config.resource], ctx),
+                 fn -> do_apply.() end
+               ) do
+            {:ok, failures} ->
+              failures
 
-          {:error, reason} ->
-            raise "AshEnvelope.Reconcile.apply_plan!/3 failed: #{inspect(reason)}"
+            {:error, reason} ->
+              raise "AshEnvelope.Reconcile.apply_plan!/3 failed: #{inspect(reason)}"
+          end
+        else
+          do_apply.()
         end
-      else
-        do_apply.()
-      end
+
+      aggregate(plan, grant_failures, revoke_failures)
     end
+  end
+
+  defp aggregate(%Plan{errors: []}, [], []), do: :ok
+
+  defp aggregate(%Plan{errors: plan_errors}, grant_failures, revoke_failures) do
+    {:error,
+     %{
+       grant_failures: grant_failures,
+       revoke_failures: revoke_failures,
+       plan_errors: plan_errors
+     }}
   end
 
   defp tap_with_requests(resources, %Context{grant_requests_config: nil}), do: resources
@@ -341,6 +381,10 @@ defmodule AshEnvelope.Reconcile.Runner do
 
   # ---- applying ----
 
+  # Each apply-side entry function returns a list of failure tuples
+  # (`{principal_id, subject_id, reason}`), empty on success, so
+  # `apply_plan!/3` can aggregate them into its return value.
+
   defp issue_grant_entry(ctx, %{
          subject: subject,
          subject_id: subject_id,
@@ -349,25 +393,30 @@ defmodule AshEnvelope.Reconcile.Runner do
        }) do
     case Granter.try_chain(ctx, subject, subject_id, target) do
       :ok ->
-        :ok
+        []
 
       :skip ->
         Logger.warning(
           "[AshEnvelope.Reconcile] no granter could issue grant for #{inspect({principal_id, subject_id})}; chain exhausted"
         )
 
-        :ok
+        []
 
       {:error, reason} ->
         Logger.warning(
           "[AshEnvelope.Reconcile] grant issuance failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
         )
 
-        :ok
+        [{principal_id, subject_id, reason}]
     end
   end
 
   defp revoke_entry(ctx, %{principal_id: principal_id, subject_id: subject_id}) do
+    revoke_grants(ctx, principal_id, subject_id) ++
+      revoke_pending_requests(ctx, principal_id, subject_id)
+  end
+
+  defp revoke_grants(ctx, principal_id, subject_id) do
     config = ctx.key_grants_config
 
     grant_query =
@@ -377,21 +426,23 @@ defmodule AshEnvelope.Reconcile.Runner do
 
     case Ash.read(grant_query, domain: ctx.domain, authorize?: false) do
       {:ok, grants} ->
-        Enum.each(grants, fn grant ->
+        Enum.flat_map(grants, fn grant ->
           # System-side revocation: bypass policies on the grants resource.
           # Authorization for *whether* to revoke was already decided by the
           # planner via `Ash.can?({subject, :read}, principal)`.
           case KeyGrants.revoke(grant, ctx.domain, authorize?: false) do
             :ok ->
-              :ok
+              []
 
             {:ok, _} ->
-              :ok
+              []
 
             {:error, reason} ->
               Logger.warning(
                 "[AshEnvelope.Reconcile] revoke failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
               )
+
+              [{principal_id, subject_id, reason}]
           end
         end)
 
@@ -399,20 +450,30 @@ defmodule AshEnvelope.Reconcile.Runner do
         Logger.warning(
           "[AshEnvelope.Reconcile] revoke read failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
         )
+
+        [{principal_id, subject_id, {:revoke_read_failed, reason}}]
     end
+  end
 
-    if requests_config = ctx.grant_requests_config do
-      case GrantRequests.revoke_pending_for(requests_config, subject_id, principal_id, ctx.domain) do
-        {:ok, _} ->
-          :ok
+  defp revoke_pending_requests(%Context{grant_requests_config: nil}, _principal_id, _subject_id),
+    do: []
 
-        {:error, reason} ->
-          Logger.warning(
-            "[AshEnvelope.Reconcile] revoke_pending_for failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
-          )
-      end
+  defp revoke_pending_requests(ctx, principal_id, subject_id) do
+    case GrantRequests.revoke_pending_for(
+           ctx.grant_requests_config,
+           subject_id,
+           principal_id,
+           ctx.domain
+         ) do
+      {:ok, _} ->
+        []
+
+      {:error, reason} ->
+        Logger.warning(
+          "[AshEnvelope.Reconcile] revoke_pending_for failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
+        )
+
+        [{principal_id, subject_id, {:revoke_pending_failed, reason}}]
     end
-
-    :ok
   end
 end
