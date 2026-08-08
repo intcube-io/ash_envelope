@@ -79,6 +79,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     repo = infer_repo(igniter.args.options[:repo], domain)
     table_name = infer_table_name(grants_resource)
     resource_table = infer_table_name(resource)
+    user_table = infer_table_name(user_resource)
     resource_rel_name = infer_relationship_name(resource)
 
     igniter
@@ -129,6 +130,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
 
       relationships do
         belongs_to :#{resource_rel_name}, #{inspect(resource)} do
+          source_attribute :#{file_id_attr}
           allow_nil? false
           public? true
         end
@@ -142,9 +144,16 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
       end
 
       actions do
+        # The `defaults` are marked primary by Ash automatically;
+        # `KeyGrants.resolve_for_actor/4` and `KeyGrants.revoke/3` rely
+        # on the primary read/destroy actions.
         defaults [:read, :destroy]
 
+        # `primary? true` is required — `KeyGrants.create_for_actor/6`
+        # (and `share/6`) call `Ash.create/2`, which needs a primary
+        # create action.
         create :create do
+          primary? true
           accept [:wrapped_dek, :#{file_id_attr}, :user_id, :expires_at]
         end
       end
@@ -229,6 +238,11 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
 
     Then paste:
 
+    # ⚠ VERIFY TABLE NAMES — the `references(...)` targets below are
+    # inferred from module names by naive pluralization. Check that
+    # "#{resource_table}" and "#{user_table}" match the actual tables of
+    # #{inspect(resource)} and #{inspect(user_resource)} before running.
+
     def change do
       create table(:#{table_name}, primary_key: false) do
         add :id, :uuid, null: false, default: fragment("gen_random_uuid()"), primary_key: true
@@ -241,7 +255,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
         # Nullable so ephemeral worker rows (no principal) can coexist
         # with user grants. The discriminator `user_id IS NULL` tells
         # the resolve paths which row kind they're dealing with.
-        add :user_id, references(:users, type: :uuid), null: true
+        add :user_id, references(:#{user_table}, type: :uuid), null: true
 
         # Optional expiry column. NULL for permanent user grants;
         # always set for ephemeral worker grants and time-bounded
@@ -493,12 +507,19 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
       end
     end
 
-    # Revoke access:
+    # Revoke access. Fetch AND revoke as the current user so the
+    # resource's policies apply — the read policy scopes which grants
+    # the actor can even see, and the destroy policy decides whether
+    # they may revoke. Never fetch with `authorize?: false` here: that
+    # would let any authenticated user revoke any grant by id.
     def handle_event("revoke", %{"grant_id" => grant_id}, socket) do
-      {:ok, grant} = Ash.get(#{inspect(grants_resource)}, grant_id, authorize?: false)
+      actor = socket.assigns.current_user
 
-      case AshEnvelope.KeyGrants.revoke(grant, #{inspect(domain)}) do
-        :ok -> {:noreply, put_flash(socket, :info, "Access revoked")}
+      with {:ok, grant} <-
+             Ash.get(#{inspect(grants_resource)}, grant_id, actor: actor, authorize?: true),
+           :ok <- AshEnvelope.KeyGrants.revoke(grant, #{inspect(domain)}, actor: actor) do
+        {:noreply, put_flash(socket, :info, "Access revoked")}
+      else
         {:error, _} -> {:noreply, put_flash(socket, :error, "Could not revoke")}
       end
     end
