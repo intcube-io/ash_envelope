@@ -76,7 +76,18 @@ defmodule Mix.Tasks.AshEnvelope.RotateBackupKey do
   def run(argv) do
     Mix.Task.run("app.start")
 
-    {opts, _, _} = OptionParser.parse(argv, switches: @switches)
+    # Strict parsing: this task performs destructive writes, so a
+    # misspelled switch (e.g. a typo'd --check-only) must abort rather
+    # than be silently discarded.
+    opts =
+      case OptionParser.parse(argv, strict: @switches) do
+        {opts, _, []} ->
+          opts
+
+        {_, _, invalid} ->
+          flags = Enum.map_join(invalid, ", ", &elem(&1, 0))
+          Mix.raise("unknown or invalid option(s): #{flags}")
+      end
 
     domain = parse_domain!(opts)
     resources = parse_resources!(opts)
@@ -101,13 +112,19 @@ defmodule Mix.Tasks.AshEnvelope.RotateBackupKey do
       Enum.reduce(resources, %{rotated: 0, skipped: %{}, remaining_stale: 0}, fn resource, acc ->
         Mix.shell().info("rotating #{inspect(resource)} ...")
 
-        {:ok, result} = BackupRotation.rotate_resource(resource, run_opts)
+        case rotate_resource(resource, run_opts) do
+          {:ok, result} ->
+            Mix.shell().info(
+              "  #{inspect(resource)}: rotated=#{result.rotated} remaining_stale=#{result.remaining_stale} skipped=#{inspect(result.skipped)}"
+            )
 
-        Mix.shell().info(
-          "  #{inspect(resource)}: rotated=#{result.rotated} remaining_stale=#{result.remaining_stale} skipped=#{inspect(result.skipped)}"
-        )
+            merge_totals(acc, result)
 
-        merge_totals(acc, result)
+          {:error, reason} ->
+            Mix.shell().error("  #{inspect(resource)}: rotation failed: #{format_reason(reason)}")
+
+            exit({:shutdown, 1})
+        end
       end)
 
     Mix.shell().info("---")
@@ -124,6 +141,19 @@ defmodule Mix.Tasks.AshEnvelope.RotateBackupKey do
       exit({:shutdown, 1})
     end
   end
+
+  # `BackupRotation.rotate_resource/2` streams via `Ash.stream!/2`, which
+  # raises on failure. Convert raised errors into the `{:error, reason}`
+  # shape its spec also allows, so the caller above can report cleanly
+  # and exit non-zero instead of crashing with a bare exception.
+  defp rotate_resource(resource, run_opts) do
+    BackupRotation.rotate_resource(resource, run_opts)
+  rescue
+    error -> {:error, error}
+  end
+
+  defp format_reason(%{__exception__: true} = error), do: Exception.message(error)
+  defp format_reason(reason), do: inspect(reason)
 
   defp parse_domain!(opts) do
     case Keyword.fetch(opts, :domain) do

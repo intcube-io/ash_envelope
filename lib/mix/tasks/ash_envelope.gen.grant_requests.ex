@@ -71,6 +71,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
     repo = infer_repo(igniter.args.options[:repo], domain)
     requests_table = infer_table_name(requests_resource)
     resource_table = infer_table_name(resource)
+    user_table = infer_table_name(user_resource)
 
     igniter
     |> Igniter.add_notice("""
@@ -206,6 +207,11 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
 
     Then paste:
 
+    # ⚠ VERIFY TABLE NAMES — the `references(...)` targets below are
+    # inferred from module names by naive pluralization. Check that
+    # "#{resource_table}" and "#{user_table}" match the actual tables of
+    # #{inspect(resource)} and #{inspect(user_resource)} before running.
+
     def change do
       create table(:#{requests_table}, primary_key: false) do
         add :id, :uuid, null: false, default: fragment("gen_random_uuid()"), primary_key: true
@@ -215,15 +221,15 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
             null: false
 
         add :user_id,
-            references(:users, type: :uuid, on_delete: :delete_all),
+            references(:#{user_table}, type: :uuid, on_delete: :delete_all),
             null: false
 
         add :requested_by_id,
-            references(:users, type: :uuid, on_delete: :nilify_all),
+            references(:#{user_table}, type: :uuid, on_delete: :nilify_all),
             null: true
 
         add :fulfilled_by_id,
-            references(:users, type: :uuid, on_delete: :nilify_all),
+            references(:#{user_table}, type: :uuid, on_delete: :nilify_all),
             null: true
 
         add :requested_at, :utc_datetime_usec, null: false
