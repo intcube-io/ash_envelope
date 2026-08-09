@@ -62,20 +62,17 @@ if Code.ensure_loaded?(Oban) do
     defp dispatch_perform({:ok, encrypted}, args), do: run_perform(encrypted, args)
 
     defp run_perform(encrypted, args) do
-      case Info.context(encrypted) do
-        {:ok, base_ctx} ->
-          actor = load_actor_arg(base_ctx, args["actor_id"])
-          principal_id = cast_id(encrypted, args["principal_id"])
-          subject_ids = Enum.map(args["subject_ids"] || [], &cast_id(encrypted, &1))
+      # Always succeeds for a resource that compiled: the required
+      # `reconcile do` fields are enforced by ValidateConfig.
+      {:ok, base_ctx} = Info.context(encrypted)
 
-          ctx = %{base_ctx | actor: actor}
-          pairs = Enum.map(subject_ids, &{principal_id, &1})
-          run_and_report(ctx, pairs)
+      actor = load_actor_arg(base_ctx, args["actor_id"])
+      principal_id = cast_id(encrypted, args["principal_id"])
+      subject_ids = Enum.map(args["subject_ids"] || [], &cast_id(encrypted, &1))
 
-        {:error, reason} ->
-          Logger.warning("[AshEnvelope.Reconcile.AsyncWorker] aborting: #{inspect(reason)}")
-          {:error, reason}
-      end
+      ctx = %{base_ctx | actor: actor}
+      pairs = Enum.map(subject_ids, &{principal_id, &1})
+      run_and_report(ctx, pairs)
     end
 
     defp run_and_report(ctx, pairs) do
