@@ -78,6 +78,20 @@ defmodule AshEnvelope.Reconcile do
   - `:request` — write a pending row to `grant_requests_resource`,
     fulfilled later by an authorized user.
 
+  ## Multitenancy
+
+  The change modules capture the triggering changeset's tenant into
+  `AshEnvelope.Reconcile.Context` and thread it through everything the
+  reconcile subsystem does: subject/candidate enumeration streams, the
+  `Ash.can?` authorization check, and every read/write against the
+  user, encrypted, grants, and grant-requests resources. `scope :all`
+  and `SyncSubject`'s candidate set therefore fan out only within the
+  triggering tenant. In `:async` mode the tenant rides in the Oban job
+  args (serialized via `Ash.ToTenant.to_tenant/2`) and is restored by
+  `AshEnvelope.Reconcile.AsyncWorker` — context-multitenancy hosts must
+  use a tenant value that survives a JSON round-trip (string/integer).
+  A `nil` tenant (single-tenant hosts) behaves exactly as before.
+
   Future work (tracked in
   [the design proposal](../proposals/reconcile-and-grant-requests.md)):
   auto-derive an `affects` plan from the encrypted resource's read

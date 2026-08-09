@@ -61,7 +61,7 @@ defmodule AshEnvelope.Reconcile.Changes.SyncSubject do
   # they would in an async worker, so the end state matches.
   defp run(subject, cs, opts, result) do
     {:ok, ctx} = Info.context(subject.__struct__)
-    ctx = %{ctx | actor: cs.context[:private][:actor], changeset: cs}
+    ctx = %{ctx | actor: cs.context[:private][:actor], changeset: cs, tenant: cs.tenant}
 
     case candidates(ctx, subject, opts) do
       {:ok, candidate_ids} ->
@@ -90,7 +90,12 @@ defmodule AshEnvelope.Reconcile.Changes.SyncSubject do
     try do
       list =
         query
-        |> Ash.stream!(domain: ctx.domain, authorize?: false, batch_size: 500)
+        |> Ash.stream!(
+          domain: ctx.domain,
+          tenant: ctx.tenant,
+          authorize?: false,
+          batch_size: 500
+        )
         |> Enum.take(max + 1)
 
       if length(list) > max do

@@ -126,7 +126,9 @@ defmodule AshEnvelope.Reconcile.Runner do
 
         case load_target(ctx, target_id) do
           {:ok, target} when not is_nil(target) ->
-            GrantRequests.fulfill(config, grants_config, request, actor, target, ctx.domain)
+            GrantRequests.fulfill(config, grants_config, request, actor, target, ctx.domain,
+              tenant: ctx.tenant
+            )
 
           {:ok, nil} ->
             {:error, :target_not_found}
@@ -141,7 +143,11 @@ defmodule AshEnvelope.Reconcile.Runner do
   end
 
   defp load_target(%Context{} = ctx, target_id) do
-    case Ash.get(ctx.user_resource, target_id, domain: ctx.domain, authorize?: false) do
+    case Ash.get(ctx.user_resource, target_id,
+           domain: ctx.domain,
+           tenant: ctx.tenant,
+           authorize?: false
+         ) do
       {:ok, user} ->
         {:ok, user}
 
@@ -247,7 +253,9 @@ defmodule AshEnvelope.Reconcile.Runner do
     with {:ok, principal} when not is_nil(principal) <- load_principal(ctx, principal_id),
          {:ok, subject} when not is_nil(subject) <- load_subject(ctx, subject_input),
          {:ok, grant_subject_id} <- resolve_grant_subject_id(ctx, subject) do
-      should_grant? = Ash.can?({subject, :read}, principal, domain: ctx.domain)
+      should_grant? =
+        Ash.can?({subject, :read}, principal, domain: ctx.domain, tenant: ctx.tenant)
+
       has_grant? = grant_exists?(ctx, grant_subject_id, principal_id)
 
       cond do
@@ -292,6 +300,7 @@ defmodule AshEnvelope.Reconcile.Runner do
   defp load_principal(ctx, principal_id) do
     Ash.get(ctx.user_resource, principal_id,
       domain: ctx.domain,
+      tenant: ctx.tenant,
       authorize?: false,
       load: ctx.user_load
     )
@@ -301,13 +310,18 @@ defmodule AshEnvelope.Reconcile.Runner do
     if ctx.subject_load == [] do
       {:ok, record}
     else
-      Ash.load(record, ctx.subject_load, domain: ctx.domain, authorize?: false)
+      Ash.load(record, ctx.subject_load,
+        domain: ctx.domain,
+        tenant: ctx.tenant,
+        authorize?: false
+      )
     end
   end
 
   defp load_subject(ctx, subject_id) do
     Ash.get(ctx.encrypted_resource, subject_id,
       domain: ctx.domain,
+      tenant: ctx.tenant,
       authorize?: false,
       load: ctx.subject_load
     )
@@ -332,7 +346,7 @@ defmodule AshEnvelope.Reconcile.Runner do
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id}])
     |> Ash.Query.limit(1)
-    |> Ash.read(domain: ctx.domain, authorize?: config.authorize?)
+    |> Ash.read(domain: ctx.domain, tenant: ctx.tenant, authorize?: config.authorize?)
     |> case do
       {:ok, [_ | _]} -> true
       _ -> false
@@ -375,13 +389,13 @@ defmodule AshEnvelope.Reconcile.Runner do
       |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
       |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id}])
 
-    case Ash.read(grant_query, domain: ctx.domain, authorize?: false) do
+    case Ash.read(grant_query, domain: ctx.domain, tenant: ctx.tenant, authorize?: false) do
       {:ok, grants} ->
         Enum.each(grants, fn grant ->
           # System-side revocation: bypass policies on the grants resource.
           # Authorization for *whether* to revoke was already decided by the
           # planner via `Ash.can?({subject, :read}, principal)`.
-          case KeyGrants.revoke(grant, ctx.domain, authorize?: false) do
+          case KeyGrants.revoke(grant, ctx.domain, authorize?: false, tenant: ctx.tenant) do
             :ok ->
               :ok
 
@@ -402,7 +416,9 @@ defmodule AshEnvelope.Reconcile.Runner do
     end
 
     if requests_config = ctx.grant_requests_config do
-      case GrantRequests.revoke_pending_for(requests_config, subject_id, principal_id, ctx.domain) do
+      case GrantRequests.revoke_pending_for(requests_config, subject_id, principal_id, ctx.domain,
+             tenant: ctx.tenant
+           ) do
         {:ok, _} ->
           :ok
 

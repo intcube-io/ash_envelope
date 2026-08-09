@@ -19,6 +19,10 @@ defmodule AshEnvelope.Reconcile.Context do
   - `:actor` — actor of the triggering action.
   - `:changeset` — the triggering changeset (used by `only_when` and
     scope predicates).
+  - `:tenant` — tenant of the triggering changeset. Threaded into every
+    Ash call the runner and granters make (reads, writes, `Ash.can?`)
+    so multitenant hosts never fan out across tenants. `nil` (the
+    default) preserves single-tenant behavior.
   - `:user_load` — optional list of loads to apply when fetching users
     (e.g. `[:encryption_private_key]` so the cloak calc resolves).
   """
@@ -40,6 +44,7 @@ defmodule AshEnvelope.Reconcile.Context do
     :grant_requests_config,
     :actor,
     :changeset,
+    :tenant,
     :subject_id_for,
     user_load: [],
     subject_load: []
@@ -69,6 +74,7 @@ defmodule AshEnvelope.Reconcile.Context do
           domain: module(),
           actor: term() | nil,
           changeset: Ash.Changeset.t() | nil,
+          tenant: term() | nil,
           subject_id_for: (Ash.Resource.record() -> term() | nil) | nil,
           user_load: list(),
           subject_load: list()
