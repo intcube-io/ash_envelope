@@ -6,10 +6,10 @@ defmodule AshEnvelope.BlobIO.KeyManagers.KeyGrantsTest do
   alias AshEnvelope.BlobIO.KeyManagers.KeyGrants
   alias AshEnvelope.KeyGrants, as: GrantsAPI
   alias AshStorage.BlobIO.BlobContext
-  alias AshStorage.Encryption.WriteFinalization
   alias AshStorage.BlobIO.Operation.PostCreate
   alias AshStorage.BlobIO.Reader
   alias AshStorage.BlobIO.Writer
+  alias AshStorage.Encryption.WriteFinalization
 
   require Ash.Query
 

@@ -16,9 +16,9 @@ defmodule AshEnvelope.Reconcile.Affecting.Transformers.InjectSyncPrincipal do
   """
   use Spark.Dsl.Transformer
 
-  alias Spark.Dsl.Transformer
   alias AshEnvelope.Reconcile.Affecting.Encrypts
   alias AshEnvelope.Reconcile.Changes.SyncPrincipal
+  alias Spark.Dsl.Transformer
 
   # Run after Ash expands `defaults [...]` into concrete action entities
   # — otherwise we'd miss those when flipping `require_atomic?`.
