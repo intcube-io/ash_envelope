@@ -76,9 +76,9 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
 
     alias AshEnvelope.BlobIO.Backup
     alias AshEnvelope.KeyGrants
-    alias AshStorage.Encryption.{RewrapOperation, WriteFinalization}
     alias AshStorage.BlobIO.Reader
     alias AshStorage.BlobIO.Writer
+    alias AshStorage.Encryption.{RewrapOperation, WriteFinalization}
 
     @format "ash_envelope_key_grants_v1"
 

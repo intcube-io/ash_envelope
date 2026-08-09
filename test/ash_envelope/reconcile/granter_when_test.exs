@@ -1,7 +1,7 @@
 defmodule AshEnvelope.Reconcile.GranterWhenTest do
   use ExUnit.Case, async: true
 
-  alias AshEnvelope.{KeyGrants}
+  alias AshEnvelope.KeyGrants
 
   alias AshEnvelope.Test.Reconcile.{
     DocumentWithAffects,

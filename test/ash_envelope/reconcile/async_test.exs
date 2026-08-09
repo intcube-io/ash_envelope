@@ -2,7 +2,7 @@ defmodule AshEnvelope.Reconcile.AsyncTest do
   # Not async: mutates Application env for the enqueuer hook.
   use ExUnit.Case, async: false
 
-  alias AshEnvelope.{KeyGrants}
+  alias AshEnvelope.KeyGrants
 
   alias AshEnvelope.Test.Reconcile.{
     DocumentWithAffects,
