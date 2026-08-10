@@ -311,19 +311,26 @@ defmodule AshEnvelope.GrantRequests do
 
   Used by reconciliation when a target loses authorization on a subject —
   any pending request for them on that subject is no longer relevant.
+
+  `opts[:authorize?]` overrides `config.authorize?` for the read and the
+  destroys. Trusted system paths (e.g. the reconcile runner, which has
+  already made the authorization decision and runs without an actor) pass
+  `authorize?: false`.
   """
-  @spec revoke_pending_for(Config.t(), term(), term(), module()) ::
+  @spec revoke_pending_for(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, non_neg_integer()} | {:error, term()}
-  def revoke_pending_for(%Config{} = config, subject_id, target_id, domain) do
+  def revoke_pending_for(%Config{} = config, subject_id, target_id, domain, opts \\ []) do
+    authorize? = Keyword.get(opts, :authorize?, config.authorize?)
+
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
-    |> Ash.read(domain: domain, authorize?: config.authorize?)
+    |> Ash.read(domain: domain, authorize?: authorize?)
     |> case do
       {:ok, requests} ->
         Enum.reduce(requests, {:ok, 0}, fn req, {:ok, count} ->
-          case Ash.destroy(req, domain: domain, authorize?: config.authorize?) do
+          case Ash.destroy(req, domain: domain, authorize?: authorize?) do
             :ok -> {:ok, count + 1}
             {:ok, _} -> {:ok, count + 1}
             {:error, _} = err -> err

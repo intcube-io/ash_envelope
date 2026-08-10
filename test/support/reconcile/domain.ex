@@ -10,5 +10,8 @@ defmodule AshEnvelope.Test.Reconcile.Domain do
     resource AshEnvelope.Test.Reconcile.AffectingMembership
     resource AshEnvelope.Test.Reconcile.Grant
     resource AshEnvelope.Test.Reconcile.GrantRequest
+    resource AshEnvelope.Test.Reconcile.MaybeDocument
+    resource AshEnvelope.Test.Reconcile.PoliciedGrant
+    resource AshEnvelope.Test.Reconcile.PoliciedGrantRequest
   end
 end
