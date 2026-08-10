@@ -12,13 +12,18 @@ defmodule AshEnvelope.SealKey do
 
   ## Key resolution
 
-  Reads from `Application.get_env(:ash_envelope, :seal_key)`. Wire it
+  An explicit `opts[:key]` takes precedence; otherwise the key is read
+  from `Application.get_env(:ash_envelope, :seal_key)`. Wire the latter
   in `runtime.exs`:
 
       config :ash_envelope,
         seal_key: System.fetch_env!("ASH_ENVELOPE_SEAL_KEY")
 
-  The value must be base64 of exactly 32 random bytes (AES-256).
+  Either way the value must be exactly 32 raw bytes or base64 of
+  exactly 32 random bytes (AES-256). The `:key` override is dependency
+  injection for callers that manage their own key material — tests in
+  particular, where mutating global application env would race
+  concurrently running suites.
 
   ## Format
 
@@ -35,8 +40,10 @@ defmodule AshEnvelope.SealKey do
 
   ## Errors
 
-  * `{:error, :missing_seal_key}` — application env not configured
-  * `{:error, :invalid_seal_key}` — env value not base64 of 32 bytes
+  * `{:error, :missing_seal_key}` — no `:key` opt and application env
+    not configured
+  * `{:error, :invalid_seal_key}` — key (from either source) is not 32
+    raw bytes or base64 of 32 bytes
   * `{:error, :unknown_seal_format}` — ciphertext doesn't match the
     expected layout or version
   * `{:error, :decryption_failed}` — authentication failed (wrong key,
@@ -47,7 +54,7 @@ defmodule AshEnvelope.SealKey do
 
   @spec seal(binary(), keyword()) :: {:ok, binary()} | {:error, term()}
   def seal(plaintext, opts \\ []) when is_binary(plaintext) do
-    with {:ok, key} <- fetch_key() do
+    with {:ok, key} <- fetch_key(opts) do
       iv = :crypto.strong_rand_bytes(12)
       aad = Keyword.get(opts, :context, "")
 
@@ -62,7 +69,7 @@ defmodule AshEnvelope.SealKey do
   def unseal(ciphertext, opts \\ [])
 
   def unseal(<<@version::8, iv::binary-12, tag::binary-16, ciphertext::binary>>, opts) do
-    with {:ok, key} <- fetch_key() do
+    with {:ok, key} <- fetch_key(opts) do
       aad = Keyword.get(opts, :context, "")
 
       case :crypto.crypto_one_time_aead(:aes_256_gcm, key, iv, ciphertext, aad, tag, false) do
@@ -74,22 +81,28 @@ defmodule AshEnvelope.SealKey do
 
   def unseal(_other, _opts), do: {:error, :unknown_seal_format}
 
-  defp fetch_key do
-    case Application.get_env(:ash_envelope, :seal_key) do
-      nil ->
-        {:error, :missing_seal_key}
-
-      <<key::binary-32>> ->
-        {:ok, key}
-
-      raw when is_binary(raw) ->
-        case Base.decode64(raw) do
-          {:ok, <<key::binary-32>>} -> {:ok, key}
-          _ -> {:error, :invalid_seal_key}
-        end
-
-      _ ->
-        {:error, :invalid_seal_key}
+  defp fetch_key(opts) do
+    case Keyword.get(opts, :key) do
+      nil -> fetch_env_key()
+      key -> validate_key(key)
     end
   end
+
+  defp fetch_env_key do
+    case Application.get_env(:ash_envelope, :seal_key) do
+      nil -> {:error, :missing_seal_key}
+      key -> validate_key(key)
+    end
+  end
+
+  defp validate_key(<<key::binary-32>>), do: {:ok, key}
+
+  defp validate_key(raw) when is_binary(raw) do
+    case Base.decode64(raw) do
+      {:ok, <<key::binary-32>>} -> {:ok, key}
+      _ -> {:error, :invalid_seal_key}
+    end
+  end
+
+  defp validate_key(_other), do: {:error, :invalid_seal_key}
 end
