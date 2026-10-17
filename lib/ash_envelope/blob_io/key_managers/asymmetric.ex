@@ -9,14 +9,21 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
 
     ## Configuration
 
-        layers [
-          {AshStorage.Layer.Encryption,
-           layer_id: "documents",
-           key_manager:
-             {AshEnvelope.BlobIO.KeyManagers.Asymmetric,
-              actor_public_key_attribute: :public_key,
-              actor_private_key_attribute: :private_key}}
-        ]
+        storage do
+          service {AshStorage.Service.S3, bucket: "private-blobs"}
+          blob_resource MyApp.DocumentBlob
+          attachment_resource MyApp.DocumentAttachment
+
+          layer {AshStorage.Layer.Encryption,
+                 key_manager:
+                   {AshEnvelope.BlobIO.KeyManagers.Asymmetric,
+                    actor_public_key_attribute: :public_key,
+                    actor_private_key_attribute: :private_key},
+                 proxy_base_url: "/storage"},
+                metadata_key: "documents"
+
+          has_one_attached :file
+        end
 
     Options:
 

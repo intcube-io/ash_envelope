@@ -345,16 +345,17 @@ The two load-bearing options:
 Match the encryption layer's signed-URL config to the proxy:
 
 ```elixir
-layers [
-  {AshStorage.Layer.Encryption,
-   layer_id: "…",
-   key_manager: {AshEnvelope.BlobIO.KeyManagers.KeyGrants, …},
-   proxy_base_url: "/storage",
-   access:
-     {:signed,
-      secret: Application.compile_env(:my_app, :proxy_signing_secret)},
-   expires_in: 300}
-]
+storage do
+  # ...
+  layer {AshStorage.Layer.Encryption,
+         key_manager: {AshEnvelope.BlobIO.KeyManagers.KeyGrants, …},
+         proxy_base_url: "/storage",
+         access:
+           {:signed,
+            secret: Application.compile_env(:my_app, :proxy_signing_secret)},
+         expires_in: 300},
+        metadata_key: "…"
+end
 ```
 
 `:expires_in` and `:max_lifetime_seconds` should normally match — the

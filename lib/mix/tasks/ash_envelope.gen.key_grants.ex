@@ -339,7 +339,10 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     └─────────────────────────────────────────────────────────────┘
 
     In #{inspect(resource)}, configure the BlobIO encryption layer with the
-    `KeyGrants` key manager:
+    `KeyGrants` key manager. `storage do` takes one `layer` entity per
+    layer (there is no `layers [...]` list), and `metadata_key` is the
+    stable identifier persisted in blob metadata — choose it once and
+    never rename it, or existing blobs become unreadable.
 
     use Ash.Resource,
       domain: #{inspect(domain)},
@@ -348,26 +351,31 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     storage do
       service {AshStorage.Service.S3, bucket: "private-blobs"}
 
-      layers [
-        {AshStorage.Layer.Encryption,
-         layer_id: "#{resource_rel_name}-vault",
-         key_manager:
-           {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
-            grants_resource: #{inspect(grants_resource)},
-            domain: #{inspect(domain)},
-            actor_public_key_attribute: :#{actor_public_key_attr},
-            actor_private_key_attribute: :#{actor_private_key_attr},
-            subject_id_attribute: :#{file_id_attr},
-            # Opt-in: time-bounded user grants AND per-attach
-            # ephemeral worker grants for deferred analyzer reads.
-            # Drop these two lines if you only want permanent user
-            # grants and have no `:oban` analyzers. See the
-            # `expiring-grants` topic for the threat model and TTL
-            # guidance.
-            expires_at_attribute: :expires_at,
-            ephemeral_ttl_seconds: 86_400},
-         proxy_base_url: "/storage"}
-      ]
+      # Your AshStorage blob + attachment resources (both required by
+      # the storage DSL). Adjust to the modules you actually use.
+      blob_resource #{inspect(resource)}Blob
+      attachment_resource #{inspect(resource)}Attachment
+
+      layer {AshStorage.Layer.Encryption,
+             key_manager:
+               {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
+                grants_resource: #{inspect(grants_resource)},
+                domain: #{inspect(domain)},
+                actor_public_key_attribute: :#{actor_public_key_attr},
+                actor_private_key_attribute: :#{actor_private_key_attr},
+                subject_id_attribute: :#{file_id_attr},
+                # Opt-in: time-bounded user grants AND per-attach
+                # ephemeral worker grants for deferred analyzer reads.
+                # Drop these two lines if you only want permanent user
+                # grants and have no `:oban` analyzers. See the
+                # `expiring-grants` topic for the threat model and TTL
+                # guidance.
+                expires_at_attribute: :expires_at,
+                ephemeral_ttl_seconds: 86_400},
+             proxy_base_url: "/storage"},
+            metadata_key: "#{resource_rel_name}-vault"
+
+      has_one_attached :#{file_attr}
     end
 
     reconcile do

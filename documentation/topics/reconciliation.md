@@ -34,18 +34,21 @@ defmodule MyApp.Document do
 
   storage do
     service {AshStorage.Service.S3, bucket: "private-blobs"}
+    blob_resource MyApp.DocumentBlob
+    attachment_resource MyApp.DocumentAttachment
 
-    layers [
-      {AshStorage.Layer.Encryption,
-       layer_id: "documents",
-       key_manager:
-         {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
-          grants_resource: MyApp.DocumentKeyGrant,
-          domain: MyApp.Catalog,
-          actor_public_key_attribute: :encryption_public_key,
-          actor_private_key_attribute: :encryption_private_key,
-          subject_id_attribute: :blob_id}}
-    ]
+    layer {AshStorage.Layer.Encryption,
+           key_manager:
+             {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
+              grants_resource: MyApp.DocumentKeyGrant,
+              domain: MyApp.Catalog,
+              actor_public_key_attribute: :encryption_public_key,
+              actor_private_key_attribute: :encryption_private_key,
+              subject_id_attribute: :blob_id},
+           proxy_base_url: "/storage"},
+          metadata_key: "documents"
+
+    has_one_attached :file
   end
 
   reconcile do

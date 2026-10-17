@@ -59,6 +59,35 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrantsTest do
     end
   end
 
+  describe "encrypted resource storage block" do
+    # The pinned ash_storage DSL has no `layers [...]` option and no
+    # `layer_id:`; a `storage do` block in that shape fails to compile
+    # with "undefined function layers/1". The scaffold must emit one
+    # `layer` entity with a `metadata_key` plus the required
+    # `blob_resource` / `attachment_resource` fields.
+    test "emits a layer entity with metadata_key, not a layers list" do
+      notice = notice(@base_argv)
+
+      assert notice =~ ~r/layer \{AshStorage\.Layer\.Encryption,/
+      assert notice =~ ~s{metadata_key: "document-vault"}
+      assert notice =~ "blob_resource MyApp.DocumentBlob"
+      assert notice =~ "attachment_resource MyApp.DocumentAttachment"
+      assert notice =~ "has_one_attached :file"
+
+      # Anchored to a DSL line so the explanatory prose ("there is no
+      # `layers [...]` list") doesn't trip the check.
+      refute notice =~ ~r/^\s*layers \[/m
+      refute notice =~ ~r/^\s*layer_id:/m
+    end
+
+    test "--file-attribute names the attachment declared on the resource" do
+      notice = notice(@base_argv ++ ["--file-attribute", "scan"])
+
+      assert notice =~ "has_one_attached :scan"
+      assert notice =~ "attachment: :scan"
+    end
+  end
+
   describe "LiveView revoke handler scaffold" do
     test "fetches the grant as the current user with authorization enabled" do
       notice = notice(@base_argv)
