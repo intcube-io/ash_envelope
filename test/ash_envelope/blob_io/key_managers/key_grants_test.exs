@@ -140,6 +140,44 @@ defmodule AshEnvelope.BlobIO.KeyManagers.KeyGrantsTest do
     end
   end
 
+  describe "wrap_dek/3 validates the manager options up front" do
+    # wrap_dek runs before the service upload and the blob create;
+    # finalize runs after both. A misconfiguration must fail the write
+    # here, not leave an uploaded ciphertext and a grant-less blob row.
+    test "fails without :domain", %{actor: actor, opts: opts} do
+      bctx = BlobContext.new(actor: actor)
+
+      assert {:error, {:key_grants_manager_option_required, :domain}} =
+               KeyGrants.wrap_dek(
+                 AshEnvelope.generate_dek(),
+                 %Writer.Operation{blob_context: bctx},
+                 Keyword.delete(opts, :domain)
+               )
+    end
+
+    test "fails without :grants_resource", %{actor: actor, opts: opts} do
+      bctx = BlobContext.new(actor: actor)
+
+      assert {:error, {:key_grants_manager_option_required, :grants_resource}} =
+               KeyGrants.wrap_dek(
+                 AshEnvelope.generate_dek(),
+                 %Writer.Operation{blob_context: bctx},
+                 Keyword.delete(opts, :grants_resource)
+               )
+    end
+
+    test "fails on a non-function :subject_id_resolver", %{actor: actor, opts: opts} do
+      bctx = BlobContext.new(actor: actor)
+
+      assert {:error, {:invalid_key_grants_subject_id_resolver, :nope}} =
+               KeyGrants.wrap_dek(
+                 AshEnvelope.generate_dek(),
+                 %Writer.Operation{blob_context: bctx},
+                 Keyword.put(opts, :subject_id_resolver, :nope)
+               )
+    end
+  end
+
   describe "with ephemeral worker grant attributes configured" do
     setup %{opts: opts} do
       previous = Application.get_env(:ash_envelope, :seal_key)
