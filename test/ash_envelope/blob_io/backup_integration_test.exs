@@ -66,6 +66,98 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
                AshEnvelope.recover_plaintext(blob, ciphertext, backup_priv)
     end
 
+    # Recovery bypasses AshStorage.Layer.Encryption, so it must enforce
+    # the same exact IV/tag lengths itself. AES-GCM happily verifies a
+    # tag of any length up to 16 bytes; a metadata writer who shortens
+    # the stored tag to one byte would otherwise turn a 2^-128 forgery
+    # bound into 2^-8.
+    test "recover_plaintext rejects a truncated tag instead of verifying against it", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, ciphertext} = write_blob(actor, "tag length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      {:ok, <<truncated::binary-1, _::binary>>} = Base.decode64(layer_metadata["tag"])
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          Map.put(layer_metadata, "tag", Base.encode64(truncated))
+        )
+
+      assert {:error, {:invalid_encryption_layer_metadata, "tag"}} =
+               AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+
+      # A forged ciphertext byte can never be accepted via a short tag.
+      <<first, rest::binary>> = ciphertext
+      forged = <<Bitwise.bxor(first, 1), rest::binary>>
+
+      for t <- 0..255 do
+        tampered =
+          replace_layer_metadata(
+            blob,
+            entry,
+            Map.put(layer_metadata, "tag", Base.encode64(<<t>>))
+          )
+
+        assert {:error, {:invalid_encryption_layer_metadata, "tag"}} =
+                 AshEnvelope.recover_plaintext(tampered, forged, backup_priv)
+      end
+    end
+
+    test "recover_plaintext rejects an IV that is not 12 bytes", %{actor: actor} do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, ciphertext} = write_blob(actor, "iv length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      {:ok, iv} = Base.decode64(layer_metadata["iv"])
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          Map.put(layer_metadata, "iv", Base.encode64(iv <> <<0>>))
+        )
+
+      assert {:error, {:invalid_encryption_layer_metadata, "iv"}} =
+               AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+    end
+
+    # A backup wrap that authenticates but does not carry a 32-byte DEK
+    # (anyone holding the backup public key can craft one) must surface
+    # as an error tuple, not as an ErlangError from :crypto.
+    test "recover_plaintext returns an error for a backup wrap holding a short DEK", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, ciphertext} = write_blob(actor, "dek length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      bogus_backup = %{
+        "format" => "x25519-ecies-v1",
+        "key_id" => Backup.key_id(backup_pub),
+        "ciphertext" => Base.encode64(ecies_wrap(backup_pub, "short"))
+      }
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          put_in(layer_metadata, ["wrapped_dek", "backup"], bogus_backup)
+        )
+
+      assert {:error, :decryption_failed} =
+               AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+    end
+
     test "no backup field when backup_public_key is unset", %{actor: actor} do
       Application.delete_env(:ash_envelope, :backup_public_key)
 
@@ -230,4 +322,45 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
 
   defp restore(key, nil), do: Application.delete_env(:ash_envelope, key)
   defp restore(key, value), do: Application.put_env(:ash_envelope, key, value)
+
+  defp write_blob(actor, content) do
+    post =
+      @resource
+      |> Ash.create!(%{title: "blob"}, domain: @domain)
+      |> Ash.update!(
+        %{io: content, filename: "b.txt", content_type: "text/plain"},
+        action: :attach_document,
+        domain: @domain,
+        actor: actor
+      )
+
+    blob = post.__metadata__[:blob]
+    {:ok, ciphertext} = AshStorage.Service.Test.download(blob.key, [])
+    {blob, ciphertext}
+  end
+
+  defp layers(blob), do: blob.metadata["ash_storage"]["blob_io"]["layers"]
+
+  defp replace_layer_metadata(blob, entry, layer_metadata) do
+    metadata =
+      put_in(blob.metadata, ["ash_storage", "blob_io", "layers"], [
+        Map.put(entry, "metadata", layer_metadata)
+      ])
+
+    %{blob | metadata: metadata}
+  end
+
+  # Same construction as AshEnvelope.wrap_dek/2 but with an arbitrary
+  # inner plaintext, as an attacker holding only the public key could do.
+  defp ecies_wrap(recipient_public_key, inner_plaintext) do
+    {eph_public, eph_private} = :crypto.generate_key(:ecdh, :x25519)
+    shared_secret = :crypto.compute_key(:ecdh, recipient_public_key, eph_private, :x25519)
+    derived_key = AshEnvelope.hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
+    iv = :crypto.strong_rand_bytes(12)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, inner_plaintext, "", true)
+
+    eph_public <> iv <> tag <> ciphertext
+  end
 end
