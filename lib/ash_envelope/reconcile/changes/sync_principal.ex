@@ -19,6 +19,12 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     user resource itself).
   - `:scope` *(optional)* — either `:all` (every encrypted record) or
     a `(Ash.Changeset.t() -> Ash.Query.t() | keyword() | [term()])` filter.
+    On an `:update` that changes attributes, the function is evaluated
+    twice — against the changeset as-is and against a pre-change view
+    whose `Ash.Changeset.get_attribute/2` falls back to the stored data
+    — and the union is reconciled, so subjects the principal *used to*
+    match (e.g. the org a membership was moved away from) have their
+    grants revoked.
   - `:only_when` *(optional)* — `(Ash.Changeset.t() -> boolean())`. When
     it returns `false`, the change is a no-op. Useful for `User.update`
     actions that only matter when a specific attribute changes.
@@ -146,7 +152,7 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
       ids ->
         with {:ok, ctx} <- Info.context(encrypted),
              ctx = %{ctx | actor: actor, changeset: cs},
-             {:ok, subjects} <- enumerate_subjects(ctx, scope, cs) do
+             {:ok, subjects} <- enumerate_scope_subjects(ctx, scope, cs) do
           pairs = for id <- ids, subject <- subjects, do: {id, subject}
           execute(Mode.resolve(opts, encrypted), ctx, pairs, result)
         else
@@ -238,6 +244,38 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
   defp ok_or({:ok, value}, _default), do: value
   defp ok_or(_, default), do: default
+
+  # The scope is a function of the changeset, so on an `:update` that
+  # changes an attribute the scope depends on (a membership reassigned
+  # from org A to org B, say) evaluating it once against the post-change
+  # changeset only yields the *new* subjects. The subjects the principal
+  # was authorized on *before* the change would never be reconciled and
+  # their grants never revoked. Mirror the old+new handling of the
+  # principal id: evaluate the scope against the changeset as-is and
+  # against a pre-change view (attributes cleared so
+  # `Ash.Changeset.get_attribute/2` falls back to the stored data), and
+  # reconcile the union.
+  defp enumerate_scope_subjects(
+         ctx,
+         scope,
+         %Ash.Changeset{action_type: :update, attributes: attrs} = cs
+       )
+       when is_function(scope, 1) and map_size(attrs) > 0 do
+    before_cs = %{cs | attributes: %{}}
+
+    with {:ok, after_subjects} <- enumerate_subjects(ctx, scope, cs),
+         {:ok, before_subjects} <- enumerate_subjects(ctx, scope, before_cs) do
+      pk = Ash.Resource.Info.primary_key(ctx.encrypted_resource)
+      {:ok, Enum.uniq_by(after_subjects ++ before_subjects, &subject_key(&1, pk))}
+    end
+  end
+
+  defp enumerate_scope_subjects(ctx, scope, cs), do: enumerate_subjects(ctx, scope, cs)
+
+  # Scope results are either loaded encrypted-resource records or bare
+  # subject ids; key records by primary key so the union dedupes.
+  defp subject_key(%_{} = record, pk), do: Map.take(record, pk)
+  defp subject_key(id, _pk), do: id
 
   defp enumerate_subjects(ctx, :all, _cs),
     do: read_subjects(ctx.encrypted_resource, ctx)
