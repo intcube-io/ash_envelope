@@ -81,15 +81,27 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
 
   @doc """
   Stream the resource's blobs and return `{rotated, skipped_by_reason,
-  remaining_stale}` after a single rotation pass.
+  failed_by_reason, remaining_stale}` after a single rotation pass.
 
   `:check_only` skips the writes but still reports counts.
+
+  `remaining_stale` counts every blob still wrapped to a non-current key
+  after the pass, whether because of `:check_only` or because its
+  rotation failed. `failed` breaks the failures down by reason (for
+  example `%{decryption_failed: 3}` when `:previous_private_key` does
+  not match the blobs' backup wrap); exceptions are keyed by their
+  module. A failure never aborts the pass.
+
+  `:ash_opts` are passed to the per-blob `Ash.get/3` and `Ash.update/3`
+  calls; `:domain` is filled in from the required `:domain` option when
+  not given.
   """
   @spec rotate_resource(module(), keyword()) ::
           {:ok,
            %{
              rotated: non_neg_integer(),
              skipped: %{skip_reason() => non_neg_integer()},
+             failed: %{term() => non_neg_integer()},
              remaining_stale: non_neg_integer()
            }}
           | {:error, term()}
@@ -98,10 +110,17 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
     domain = Keyword.fetch!(opts, :domain)
     check_only? = Keyword.get(opts, :check_only, false)
 
+    ash_opts =
+      opts
+      |> Keyword.get(:ash_opts, [])
+      |> Keyword.put_new(:domain, domain)
+
+    rotate_opts = Keyword.put(opts, :ash_opts, ash_opts)
+
     resource
     |> Ash.Query.new()
     |> Ash.stream!(domain: domain, batch_size: batch_size)
-    |> Enum.reduce(%{rotated: 0, skipped: %{}, remaining_stale: 0}, fn blob, acc ->
+    |> Enum.reduce(%{rotated: 0, skipped: %{}, failed: %{}, remaining_stale: 0}, fn blob, acc ->
       case classify(blob) do
         {:ok, _layer_metadata, _backup, key_id} ->
           current_key_id = Backup.current_key_id()
@@ -114,9 +133,14 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
               %{acc | remaining_stale: acc.remaining_stale + 1}
 
             true ->
-              case rotate(blob, opts) do
-                {:ok, _} -> %{acc | rotated: acc.rotated + 1}
-                {:error, _reason} -> %{acc | remaining_stale: acc.remaining_stale + 1}
+              case rotate(blob, rotate_opts) do
+                {:ok, _} ->
+                  %{acc | rotated: acc.rotated + 1}
+
+                {:error, reason} ->
+                  acc
+                  |> bump_failed(reason)
+                  |> Map.update!(:remaining_stale, &(&1 + 1))
               end
           end
 
@@ -129,33 +153,44 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
 
   # Writes back the blob's entire metadata map — an unguarded
   # read-modify-write. The blob typically arrives from a long batch
-  # stream, so it is re-fetched immediately before computing the new
-  # metadata; that shrinks the clobber window for concurrent metadata
-  # writers from the whole batch pass to milliseconds. Full protection
-  # needs optimistic locking upstream in ash_storage.
-  defp do_rotate(blob, backup, previous_private_key, current_public_key, opts) do
+  # stream, so it is re-fetched first and *everything* — the backup wrap
+  # that is unwrapped, the key_id that is compared, the metadata that is
+  # rewritten — comes from that fresh row. Unwrapping the DEK from the
+  # streamed snapshot and writing it into the fresh row would, if the
+  # row's envelope changed in between, persist a backup wrap of a DEK
+  # the blob no longer uses, i.e. an unrecoverable blob that reports
+  # itself as current. The re-fetch also shrinks the clobber window for
+  # concurrent metadata writers from the whole batch pass to
+  # milliseconds; full protection needs optimistic locking upstream in
+  # ash_storage.
+  defp do_rotate(blob, _snapshot_backup, previous_private_key, current_public_key, opts) do
     ash_opts = Keyword.get(opts, :ash_opts, [])
 
-    with {:ok, dek} <- Backup.unwrap_backup(backup, previous_private_key),
-         {:ok, fresh_blob} <- refetch(blob, ash_opts),
-         {:ok, layer_index, layer_entry, layer_metadata, _backup, _key_id} <-
+    with {:ok, fresh_blob} <- refetch(blob, ash_opts),
+         {:ok, layer_index, layer_entry, layer_metadata, backup, key_id} <-
            locate_layer(fresh_blob) do
-      new_backup = Backup.wrap_for_public_key(dek, current_public_key)
-      wrapped_dek = Map.fetch!(layer_metadata, "wrapped_dek")
-      new_wrapped_dek = Backup.put_backup(wrapped_dek, new_backup)
-      new_layer_metadata = Map.put(layer_metadata, "wrapped_dek", new_wrapped_dek)
+      if key_id == Backup.key_id(current_public_key) do
+        {:ok, fresh_blob}
+      else
+        with {:ok, dek} <- Backup.unwrap_backup(backup, previous_private_key) do
+          new_backup = Backup.wrap_for_public_key(dek, current_public_key)
+          wrapped_dek = Map.fetch!(layer_metadata, "wrapped_dek")
+          new_wrapped_dek = Backup.put_backup(wrapped_dek, new_backup)
+          new_layer_metadata = Map.put(layer_metadata, "wrapped_dek", new_wrapped_dek)
 
-      new_layer_entry = put_entry_metadata(layer_entry, new_layer_metadata)
-      layer_chain = layer_chain(fresh_blob.metadata)
-      new_layer_chain = List.replace_at(layer_chain, layer_index, new_layer_entry)
+          new_layer_entry = put_entry_metadata(layer_entry, new_layer_metadata)
+          layer_chain = layer_chain(fresh_blob.metadata)
+          new_layer_chain = List.replace_at(layer_chain, layer_index, new_layer_entry)
 
-      new_metadata = Support.put_layer_metadata(fresh_blob.metadata || %{}, new_layer_chain)
+          new_metadata = Support.put_layer_metadata(fresh_blob.metadata || %{}, new_layer_chain)
 
-      Ash.update(
-        fresh_blob,
-        %{metadata: new_metadata},
-        Keyword.merge(ash_opts, action: :update_metadata)
-      )
+          Ash.update(
+            fresh_blob,
+            %{metadata: new_metadata},
+            Keyword.merge(ash_opts, action: :update_metadata)
+          )
+        end
+      end
     end
   end
 
@@ -261,4 +296,16 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
 
   defp bump_skipped(acc, reason),
     do: %{acc | skipped: Map.update(acc.skipped, reason, 1, &(&1 + 1))}
+
+  defp bump_failed(acc, reason) do
+    key = failure_key(reason)
+    %{acc | failed: Map.update(acc.failed, key, 1, &(&1 + 1))}
+  end
+
+  # Collapse exception structs (Ash errors from get/update) to their
+  # module so the breakdown stays countable and never carries record
+  # contents into task output.
+  defp failure_key(%{__exception__: true, __struct__: module}), do: module
+  defp failure_key(reason) when is_atom(reason) or is_tuple(reason), do: reason
+  defp failure_key(_reason), do: :unknown
 end
