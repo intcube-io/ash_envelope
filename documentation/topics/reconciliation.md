@@ -62,6 +62,13 @@ defmodule MyApp.Document do
     granter_chain [:actor, :request]
     user_load [:encryption_private_key]
 
+    # The KeyGrants manager keys grants by the blob id (`bctx.blob.id`),
+    # so reconcile must derive the same id from a Document: walk the
+    # `:file` attachment to its `blob_id`. A Document without an
+    # attachment yields nil and is skipped.
+    subject_load [:file]
+    subject_id_for fn doc -> doc.file && doc.file.blob_id end
+
     affects MyApp.Membership do
       actions [:create, :update, :destroy]
       principal :user_id
@@ -103,7 +110,14 @@ mix ash_envelope.gen.grant_requests MyApp.Document \
 When the encrypted resource is an AshStorage attachment using the
 `KeyGrants` BlobIO key manager (as above), the same grants resource is
 referenced on both sides. Keep the values in `reconcile do` and the
-key-manager opts in sync — they read and write the same table.
+key-manager opts in sync — they read and write the same table. In
+particular both sides must agree on *which id* is the subject: the
+manager always uses the blob row's id (the owning record is not on the
+`BlobContext` for proxy, analyzer, or download reads), so `reconcile do`
+needs `subject_load` + `subject_id_for` to map a record to its blob id
+as shown above. Without them, reconcile looks grants up by the record id,
+never finds the manager's rows, and re-issues or queues requests for
+every pair on every pass.
 
 ### 2. Install the change on each affecting resource
 

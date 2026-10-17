@@ -35,9 +35,46 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequestsTest do
 
       assert notice =~ ~r/create :create do\s+primary\? true/
     end
+
+    # Reconcile hands `GrantRequests.create/6` the grant subject id, which
+    # the KeyGrants BlobIO manager derives from `bctx.blob.id`. The
+    # requests table must therefore be keyed by the blob row like the
+    # grants table, with the same `:blob_id` default.
+    test "belongs_to targets the blob resource with the :blob_id default" do
+      notice = notice(@base_argv)
+
+      assert notice =~
+               ~r/belongs_to :blob, MyApp\.DocumentBlob do\s+source_attribute :blob_id/
+
+      assert notice =~ "subject_id_attribute: :blob_id"
+      refute notice =~ ~r/belongs_to :document, MyApp\.Document/
+    end
+
+    test "--blob-resource and --subject-id-attribute flow through" do
+      notice =
+        notice(
+          @base_argv ++
+            ["--blob-resource", "MyApp.Storage.Blob", "--subject-id-attribute", "blob_ref_id"]
+        )
+
+      assert notice =~
+               ~r/belongs_to :blob, MyApp\.Storage\.Blob do\s+source_attribute :blob_ref_id/
+
+      assert notice =~ ~r/add :blob_ref_id,\s+references\(:blobs, type: :uuid/
+      assert notice =~ "subject_id_attribute: :blob_ref_id"
+    end
   end
 
   describe "migration scaffold" do
+    test "subject FK references the blob table, not the owning record's table" do
+      notice = notice(@base_argv)
+
+      assert notice =~
+               ~r/add :blob_id,\s+references\(:document_blobs, type: :uuid, on_delete: :delete_all\)/
+
+      refute notice =~ "references(:documents"
+    end
+
     test "user FKs reference the table derived from --user-resource" do
       notice = notice(@base_argv)
 
@@ -65,7 +102,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequestsTest do
       notice = notice(@base_argv)
 
       assert notice =~ "VERIFY TABLE NAMES"
-      assert notice =~ ~s{"documents" and "users"}
+      assert notice =~ ~s{"document_blobs" and "users"}
     end
   end
 end
