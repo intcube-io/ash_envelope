@@ -372,6 +372,52 @@ defmodule AshEnvelope.GrantRequestsTest do
                  target_loader
                )
     end
+
+    test "counts a target without a public key as an error and keeps going", ctx do
+      # A target that has not generated keys yet is a normal data
+      # condition for a batch fulfiller, not a programmer error: it must
+      # be counted, not abort the whole run.
+      subject_a = Ash.UUID.generate()
+      subject_b = Ash.UUID.generate()
+      dek_a = AshEnvelope.generate_dek()
+      dek_b = AshEnvelope.generate_dek()
+
+      :ok = KeyGrants.create_for_actor(ctx.grants_config, subject_a, dek_a, ctx.actor, @domain)
+      :ok = KeyGrants.create_for_actor(ctx.grants_config, subject_b, dek_b, ctx.actor, @domain)
+
+      keyless = %{id: Ash.UUID.generate()}
+
+      :ok = GrantRequests.create(ctx.requests_config, subject_a, keyless, ctx.requester, @domain)
+
+      :ok =
+        GrantRequests.create(ctx.requests_config, subject_b, ctx.target, ctx.requester, @domain)
+
+      target = ctx.target
+
+      target_loader = fn
+        id when id == keyless.id -> {:ok, keyless}
+        _ -> {:ok, target}
+      end
+
+      assert {1, 1} =
+               GrantRequests.fulfill_outstanding(
+                 ctx.requests_config,
+                 ctx.grants_config,
+                 ctx.actor,
+                 @domain,
+                 target_loader
+               )
+
+      # The keyed target was served despite the keyless one failing.
+      {:ok, ^dek_b} =
+        KeyGrants.resolve_for_actor(ctx.grants_config, subject_b, ctx.target, @domain)
+
+      # The keyless target's request is still pending for a later run.
+      {:ok, [pending]} =
+        GrantRequests.list_pending_for_subject(ctx.requests_config, subject_a, @domain)
+
+      assert pending.user_id == keyless.id
+    end
   end
 
   describe "revoke_pending_for/4" do

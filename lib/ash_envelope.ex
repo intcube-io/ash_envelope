@@ -256,24 +256,48 @@ defmodule AshEnvelope do
   Resolve a 32-byte key from an actor struct attribute.
 
   Accepts a raw 32-byte binary or a base64-encoded string that decodes to
-  exactly 32 bytes.
+  exactly 32 bytes. Raises `ArgumentError` otherwise; see
+  `fetch_actor_key/2` for the non-raising variant.
   """
   @spec resolve_actor_key(term(), atom()) :: binary()
   def resolve_actor_key(actor, attr) do
+    case fetch_actor_key(actor, attr) do
+      {:ok, key} -> key
+      {:error, _} -> raise_invalid_actor_key!(attr, if(actor, do: Map.get(actor, attr)))
+    end
+  end
+
+  @doc """
+  Non-raising counterpart of `resolve_actor_key/2`.
+
+  Returns `{:ok, key}` for a raw 32-byte binary or a base64-encoded
+  string that decodes to exactly 32 bytes. Returns
+  `{:error, {:missing_actor_key, attr}}` when the actor is `nil` or the
+  attribute is `nil` (a principal that has not generated keys yet, or
+  one loaded without the key attribute), and
+  `{:error, {:invalid_actor_key, attr}}` for any other value. The key
+  bytes never appear in the error.
+  """
+  @spec fetch_actor_key(term(), atom()) ::
+          {:ok, binary()} | {:error, {:missing_actor_key | :invalid_actor_key, atom()}}
+  def fetch_actor_key(actor, attr) do
     raw = if actor, do: Map.get(actor, attr)
 
     case raw do
+      nil ->
+        {:error, {:missing_actor_key, attr}}
+
       <<key::binary-32>> ->
-        key
+        {:ok, key}
 
       raw when is_binary(raw) ->
         case Base.decode64(raw) do
-          {:ok, <<key::binary-32>>} -> key
-          _ -> raise_invalid_actor_key!(attr, raw)
+          {:ok, <<key::binary-32>>} -> {:ok, key}
+          _ -> {:error, {:invalid_actor_key, attr}}
         end
 
       _ ->
-        raise_invalid_actor_key!(attr, raw)
+        {:error, {:invalid_actor_key, attr}}
     end
   end
 

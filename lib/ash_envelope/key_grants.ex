@@ -67,31 +67,36 @@ defmodule AshEnvelope.KeyGrants do
   `opts[:expires_at]` accepts a `DateTime` to make the grant
   time-bounded; requires `Config.expires_at_attribute` to be set.
 
-  Returns `:ok` on success or `{:error, reason}` on failure.
+  Returns `:ok` on success or `{:error, reason}` on failure. An actor
+  without a usable public key (attribute `nil`, or not a 32-byte key)
+  yields `{:error, {:missing_actor_key, attr}}` or
+  `{:error, {:invalid_actor_key, attr}}` rather than raising, so batch
+  callers (`AshEnvelope.GrantRequests.fulfill_outstanding/5`,
+  reconciliation) can count the failure and move on.
   """
   @spec create_for_actor(Config.t(), term(), binary(), term(), module(), keyword()) ::
           :ok | {:error, term()}
   def create_for_actor(%Config{} = config, subject_id, raw_dek, actor, domain, opts \\ []) do
-    case principal_id(actor) do
-      nil ->
-        {:error, :missing_principal}
+    with pid when not is_nil(pid) <- principal_id(actor),
+         {:ok, public_key} <-
+           AshEnvelope.fetch_actor_key(actor, config.actor_public_key_attribute) do
+      wrapped = raw_dek |> AshEnvelope.wrap_dek(public_key) |> Base.encode64()
 
-      pid ->
-        public_key = AshEnvelope.resolve_actor_key(actor, config.actor_public_key_attribute)
-        wrapped = raw_dek |> AshEnvelope.wrap_dek(public_key) |> Base.encode64()
+      attrs = %{
+        config.subject_id_attribute => subject_id,
+        config.principal_id_attribute => pid,
+        config.dek_attribute => wrapped
+      }
 
-        attrs = %{
-          config.subject_id_attribute => subject_id,
-          config.principal_id_attribute => pid,
-          config.dek_attribute => wrapped
-        }
+      attrs = maybe_put_expires_at(attrs, config, Keyword.get(opts, :expires_at))
 
-        attrs = maybe_put_expires_at(attrs, config, Keyword.get(opts, :expires_at))
-
-        case Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?) do
-          {:ok, _} -> :ok
-          {:error, _} = err -> err
-        end
+      case Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?) do
+        {:ok, _} -> :ok
+        {:error, _} = err -> err
+      end
+    else
+      nil -> {:error, :missing_principal}
+      {:error, _} = err -> err
     end
   end
 
@@ -103,6 +108,12 @@ defmodule AshEnvelope.KeyGrants do
   (`{:error, :not_found}`).
 
   Returns `{:ok, raw_dek}` (32-byte binary) or `{:error, :not_found}`.
+  When a live grant exists but the actor carries no usable private key,
+  returns `{:error, {:missing_actor_key, attr}}` or
+  `{:error, {:invalid_actor_key, attr}}` rather than raising. The key
+  check runs after the grant lookup, so an actor loaded with only a
+  public key still gets `:not_found` when they hold no grant (this is
+  what lets `share/6` accept public-key-only targets).
   """
   @spec resolve_for_actor(Config.t(), term(), term(), module()) ::
           {:ok, binary()}
@@ -122,11 +133,10 @@ defmodule AshEnvelope.KeyGrants do
 
         with {:ok, [grant | _]} <- Ash.read(query, domain: domain, authorize?: config.authorize?),
              :ok <- check_not_expired(grant, config),
+             {:ok, private_key} <-
+               AshEnvelope.fetch_actor_key(actor, config.actor_private_key_attribute),
              {:ok, decoded} <- Base.decode64(Map.get(grant, config.dek_attribute)) do
-          AshEnvelope.unwrap_dek(
-            decoded,
-            AshEnvelope.resolve_actor_key(actor, config.actor_private_key_attribute)
-          )
+          AshEnvelope.unwrap_dek(decoded, private_key)
         else
           {:ok, []} -> {:error, :not_found}
           {:error, :expired} -> {:error, :not_found}
