@@ -66,6 +66,55 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
                AshEnvelope.recover_plaintext(blob, ciphertext, backup_priv)
     end
 
+    # A backup wrap that authenticates but carries a short inner plaintext
+    # (craftable by anyone holding the backup public key) must not come
+    # back from recover_dek/2 as a short "DEK".
+    test "recover_dek rejects a backup wrap whose inner ciphertext is not 32 bytes", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      post =
+        @resource
+        |> Ash.create!(%{title: "Short DEK"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "dek length matters", filename: "d.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      blob = post.__metadata__[:blob]
+
+      [%{"metadata" => layer_metadata} = entry] =
+        blob.metadata["ash_storage"]["blob_io"]["layers"]
+
+      {eph_public, eph_private} = :crypto.generate_key(:ecdh, :x25519)
+      shared_secret = :crypto.compute_key(:ecdh, backup_pub, eph_private, :x25519)
+      derived_key = AshEnvelope.hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
+      iv = :crypto.strong_rand_bytes(12)
+      {ct, tag} = :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, "short", "", true)
+
+      bogus_backup = %{
+        "format" => "x25519-ecies-v1",
+        "key_id" => Backup.key_id(backup_pub),
+        "ciphertext" => Base.encode64(eph_public <> iv <> tag <> ct)
+      }
+
+      tampered_metadata =
+        put_in(blob.metadata, ["ash_storage", "blob_io", "layers"], [
+          Map.put(
+            entry,
+            "metadata",
+            put_in(layer_metadata, ["wrapped_dek", "backup"], bogus_backup)
+          )
+        ])
+
+      assert {:error, :malformed_blob} =
+               AshEnvelope.recover_dek(%{blob | metadata: tampered_metadata}, backup_priv)
+    end
+
     test "no backup field when backup_public_key is unset", %{actor: actor} do
       Application.delete_env(:ash_envelope, :backup_public_key)
 
