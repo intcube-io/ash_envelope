@@ -298,6 +298,101 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
       assert BackupRotation.needs_rotation?(reread) == true
     end
 
+    # The struct handed to rotate/2 usually comes out of a long Ash.stream!
+    # pass and may be stale. Everything rotation writes must derive from
+    # the row as it is *now*: if the row's envelope was replaced (new DEK,
+    # new backup wrap under the previous key) after the snapshot was
+    # taken, re-wrapping the snapshot's DEK would persist a backup of a
+    # key the blob no longer uses — an unrecoverable blob whose key_id
+    # claims it is current.
+    test "re-wraps the DEK from the stored row, not from the streamed snapshot", %{
+      actor: actor
+    } do
+      {old_pub, old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      post =
+        @resource
+        |> Ash.create!(%{title: "Stale snapshot"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "stale", filename: "s.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      snapshot = post.__metadata__[:blob]
+      {:ok, original_dek} = AshEnvelope.recover_dek(snapshot, old_priv)
+
+      # Concurrent writer replaces the row's envelope with a fresh DEK,
+      # still escrowed under the (then current) old backup key.
+      replacement_dek = AshEnvelope.generate_dek()
+
+      [%{"metadata" => layer_metadata} = entry] =
+        snapshot.metadata["ash_storage"]["blob_io"]["layers"]
+
+      replaced_layer_metadata =
+        put_in(
+          layer_metadata,
+          ["wrapped_dek", "backup"],
+          Backup.wrap_for_public_key(replacement_dek, old_pub)
+        )
+
+      replaced_metadata =
+        put_in(snapshot.metadata, ["ash_storage", "blob_io", "layers"], [
+          Map.put(entry, "metadata", replaced_layer_metadata)
+        ])
+
+      {:ok, _} =
+        Ash.update(snapshot, %{metadata: replaced_metadata},
+          action: :update_metadata,
+          domain: @domain
+        )
+
+      {new_pub, new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      # Rotation is driven from the stale snapshot.
+      assert {:ok, rotated} = BackupRotation.rotate(snapshot, previous_private_key: old_priv)
+
+      assert AshEnvelope.recover_dek(rotated, new_priv) == {:ok, replacement_dek}
+      refute AshEnvelope.recover_dek(rotated, new_priv) == {:ok, original_dek}
+    end
+
+    test "a stale snapshot of a row that was already rotated is a no-op", %{actor: actor} do
+      {old_pub, old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      post =
+        @resource
+        |> Ash.create!(%{title: "Already rotated elsewhere"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "twice", filename: "t.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      snapshot = post.__metadata__[:blob]
+
+      {new_pub, new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      # Another run rotates the row first.
+      {:ok, blob} = Ash.get(@blob_resource, snapshot.id, domain: @domain)
+      assert {:ok, _} = BackupRotation.rotate(blob, previous_private_key: old_priv)
+
+      # This run still holds the pre-rotation snapshot and does not even
+      # hold a usable previous key; it must observe the row is current
+      # rather than fail (or re-wrap) based on the snapshot.
+      {_pub, unrelated_priv} = AshEnvelope.generate_key_pair()
+      assert {:ok, fresh} = BackupRotation.rotate(snapshot, previous_private_key: unrelated_priv)
+      assert BackupRotation.needs_rotation?(fresh) == false
+      assert {:ok, _dek} = AshEnvelope.recover_dek(fresh, new_priv)
+    end
+
     test "is idempotent when the blob already uses the current key", %{actor: actor} do
       {pub, _priv} = AshEnvelope.generate_key_pair()
       Application.put_env(:ash_envelope, :backup_public_key, pub)
@@ -340,10 +435,41 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
       {new_pub, _new_priv} = AshEnvelope.generate_key_pair()
       Application.put_env(:ash_envelope, :backup_public_key, new_pub)
 
-      assert {:ok, %{rotated: 0, remaining_stale: 1}} =
+      assert {:ok, %{rotated: 0, remaining_stale: 1, failed: %{}}} =
                BackupRotation.rotate_resource(@blob_resource,
                  domain: @domain,
                  check_only: true
+               )
+    end
+
+    # A blob whose rotation fails is still counted as stale (the CLI's
+    # exit-1 gate), but the operator also needs to know *why* — a wrong
+    # previous key, an authorization failure and a lost row look
+    # identical as a bare "remaining_stale" count.
+    test "reports per-reason failure counts instead of swallowing them", %{actor: actor} do
+      {old_pub, _old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      _post =
+        @resource
+        |> Ash.create!(%{title: "fail"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "fail this", filename: "f.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      {new_pub, _new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      {_pub, wrong_priv} = AshEnvelope.generate_key_pair()
+
+      assert {:ok, %{rotated: 0, remaining_stale: 1, failed: %{decryption_failed: 1}}} =
+               BackupRotation.rotate_resource(@blob_resource,
+                 domain: @domain,
+                 previous_private_key: wrong_priv
                )
     end
   end
