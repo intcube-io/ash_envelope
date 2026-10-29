@@ -22,8 +22,13 @@ defmodule AshEnvelope.Reconcile.Granter do
     uploaded blob, before any user has a grant to share from.
   - `:actor` — the actor of the triggering changeset must already hold a
     grant on `subject_id` AND have their private key loaded on their
-    user struct. Calls `AshEnvelope.KeyGrants.share/5`. Accepts `{:actor, opts}`
-    form for `:when` filtering — see below.
+    user struct. Calls `AshEnvelope.KeyGrants.share/5`. Returns `:skip`
+    (so the chain advances, typically to `:request`) when the actor holds
+    no grant on the subject or cannot open the one they hold — missing
+    row, corrupted wrap, or a private key that no longer matches it after
+    a key rotation. Only a failure to write the *target's* grant is
+    terminal. Accepts `{:actor, opts}` form for `:when` filtering — see
+    below.
   - `:request` — write a pending `GrantRequests` row. Requires the
     encrypted resource's `reconcile do` block to set
     `grant_requests_resource`. Accepts `{:request, opts}` form for
@@ -59,6 +64,7 @@ defmodule AshEnvelope.Reconcile.Granter do
   alias AshEnvelope.Reconcile.Context
 
   require Ash.Query
+  require Logger
 
   @type result :: :ok | :skip | {:error, term()}
 
@@ -165,11 +171,42 @@ defmodule AshEnvelope.Reconcile.Granter do
         :skip
 
       true ->
-        case KeyGrants.share(ctx.key_grants_config, subject_id, actor, target, ctx.domain) do
+        share_from_actor(ctx, subject_id, actor, target)
+    end
+  end
+
+  # The actor can only act as a granter if they can open their own grant
+  # on the subject. Check that first, separately from the share: a
+  # `KeyGrants.share/5` error collapses "the actor holds no usable grant"
+  # (no row, unparseable row, or a private key that no longer matches the
+  # wrap — e.g. after a key rotation) with "writing the target's grant
+  # failed". Only the latter is terminal for the pair; the former just
+  # means this actor can't help, and the chain must fall through so
+  # `:request` lets another holder fulfill the grant later. Treating it as
+  # terminal left the target without a grant *and* without a request.
+  defp share_from_actor(ctx, subject_id, actor, target) do
+    config = ctx.key_grants_config
+
+    case KeyGrants.resolve_for_actor(config, subject_id, actor, ctx.domain) do
+      {:ok, _raw_dek} ->
+        case KeyGrants.share(config, subject_id, actor, target, ctx.domain) do
           :ok -> :ok
           {:error, :not_found} -> :skip
           {:error, _} = err -> err
         end
+
+      {:error, :not_found} ->
+        :skip
+
+      {:error, reason} when reason in [:decryption_failed, :corrupted_dek] ->
+        Logger.warning(
+          "[AshEnvelope.Reconcile.Granter] :actor cannot open its own grant on #{inspect(subject_id)} (#{inspect(reason)}); falling through to the next strategy"
+        )
+
+        :skip
+
+      {:error, _} = err ->
+        err
     end
   end
 

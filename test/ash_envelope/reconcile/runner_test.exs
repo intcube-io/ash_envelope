@@ -128,6 +128,40 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert {:ok, %_{}} = pending_request_for(target, doc)
     end
 
+    # The actor holds a grant, but it was wrapped to a public key they no
+    # longer own (keypair rotated afterwards). `:actor` used to surface
+    # the resulting `:decryption_failed` as a terminal error, halting the
+    # chain: the target ended up with neither a grant nor a pending
+    # request, and in sync mode nothing ever retried.
+    test ":actor whose key cannot open their grant falls through to :request" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      dek = AshEnvelope.generate_dek()
+      :ok = KeyGrants.create_for_actor(grants_config(), doc.id, dek, actor, @domain)
+
+      {new_pub, new_priv} = AshEnvelope.generate_key_pair()
+
+      {:ok, actor} =
+        Ash.update(actor, %{public_key: new_pub, private_key: new_priv},
+          domain: @domain,
+          authorize?: false
+        )
+
+      assert {:error, :decryption_failed} =
+               KeyGrants.resolve_for_actor(grants_config(), doc.id, actor, @domain)
+
+      ctx = build_context(actor)
+
+      log = capture_log(fn -> assert :ok = Runner.run(ctx, [{target.id, doc.id}]) end)
+      assert log =~ "cannot open its own grant"
+
+      assert {:ok, nil} = grant_for(target, doc)
+      assert {:ok, %_{}} = pending_request_for(target, doc)
+    end
+
     test "actor IS the target — skips :actor and falls through to :request" do
       actor_target = make_user(:user)
       doc = make_document()
