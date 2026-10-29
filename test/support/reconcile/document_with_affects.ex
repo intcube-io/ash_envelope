@@ -23,6 +23,7 @@ defmodule AshEnvelope.Test.Reconcile.DocumentWithAffects do
     domain(AshEnvelope.Test.Reconcile.Domain)
     key_grants_resource(AshEnvelope.Test.Reconcile.Grant)
     key_grants_subject_id_attribute(:document_id)
+    key_grants_expires_at_attribute(:expires_at)
     actor_public_key_attribute(:public_key)
     actor_private_key_attribute(:private_key)
     grant_requests_resource(AshEnvelope.Test.Reconcile.GrantRequest)
