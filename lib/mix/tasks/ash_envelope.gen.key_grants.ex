@@ -23,8 +23,12 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
   * `--grants-resource` - Module name for the key grants resource (required)
   * `--domain` - The Ash domain module (required)
   * `--user-resource` - The user/actor resource module (required)
-  * `--file-id-attribute` - FK name on grants table for the file resource
-    (default: inferred from resource name, e.g. MyApp.Document -> :document_id)
+  * `--blob-resource` - The `AshStorage.BlobResource` module the attachment
+    stores into. Grants are keyed by the blob row, because that is the only
+    id the `KeyGrants` BlobIO manager sees on every read path (default:
+    inferred from the resource name, e.g. MyApp.Document -> MyApp.DocumentBlob)
+  * `--file-id-attribute` - FK name on the grants table pointing at the blob
+    row (default: `:blob_id`, matching `AshEnvelope.KeyGrants.Config`)
   * `--actor-public-key-attribute` - Attribute on actor holding their X25519
     public key (default: `:encryption_public_key`)
   * `--actor-private-key-attribute` - Attribute on actor holding their X25519
@@ -43,6 +47,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
         grants_resource: :string,
         domain: :string,
         user_resource: :string,
+        blob_resource: :string,
         file_id_attribute: :string,
         actor_public_key_attribute: :string,
         actor_private_key_attribute: :string,
@@ -59,12 +64,18 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     grants_resource = Igniter.Project.Module.parse(igniter.args.options[:grants_resource])
     domain = Igniter.Project.Module.parse(igniter.args.options[:domain])
     user_resource = Igniter.Project.Module.parse(igniter.args.options[:user_resource])
+    blob_resource = infer_blob_resource(igniter.args.options[:blob_resource], resource)
 
+    # Grants are keyed by the blob row: `AshEnvelope.BlobIO.KeyManagers.KeyGrants`
+    # resolves the subject id from `bctx.blob.id` (the owning record is not
+    # on the BlobContext for proxy / analyzer / download reads), so the FK
+    # must point at the blob table and defaults to the library-wide
+    # `:blob_id` (see `AshEnvelope.KeyGrants.Config`).
     file_id_attr =
       if igniter.args.options[:file_id_attribute] do
         String.to_atom(igniter.args.options[:file_id_attribute])
       else
-        infer_file_id_attribute(resource)
+        :blob_id
       end
 
     actor_public_key_attr =
@@ -78,7 +89,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     file_attr = String.to_atom(igniter.args.options[:file_attribute] || "file")
     repo = infer_repo(igniter.args.options[:repo], domain)
     table_name = infer_table_name(grants_resource)
-    resource_table = infer_table_name(resource)
+    blob_table = infer_table_name(blob_resource)
     user_table = infer_table_name(user_resource)
     resource_rel_name = infer_relationship_name(resource)
 
@@ -129,7 +140,13 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
       end
 
       relationships do
-        belongs_to :#{resource_rel_name}, #{inspect(resource)} do
+        # Grants hang off the BLOB row, not off #{inspect(resource)}. The
+        # `KeyGrants` BlobIO manager derives the subject id from
+        # `bctx.blob.id` on every write and read — the owning record is
+        # not on the BlobContext for proxy / analyzer / download reads —
+        # so this FK must reference the blob table (see step 2) and the
+        # reconcile block must map a record to its blob id (see step 4).
+        belongs_to :blob, #{inspect(blob_resource)} do
           source_attribute :#{file_id_attr}
           allow_nil? false
           public? true
@@ -240,16 +257,18 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
 
     # ⚠ VERIFY TABLE NAMES — the `references(...)` targets below are
     # inferred from module names by naive pluralization. Check that
-    # "#{resource_table}" and "#{user_table}" match the actual tables of
-    # #{inspect(resource)} and #{inspect(user_resource)} before running.
+    # "#{blob_table}" and "#{user_table}" match the actual tables of
+    # #{inspect(blob_resource)} and #{inspect(user_resource)} before running.
 
     def change do
       create table(:#{table_name}, primary_key: false) do
         add :id, :uuid, null: false, default: fragment("gen_random_uuid()"), primary_key: true
         add :wrapped_dek, :text, null: false
 
+        # References the BLOB table: the subject id the KeyGrants manager
+        # writes and reads is `blob.id`, never the owning record's id.
         add :#{file_id_attr},
-            references(:#{resource_table}, type: :uuid, on_delete: :delete_all),
+            references(:#{blob_table}, type: :uuid, on_delete: :delete_all),
             null: false
 
         # Nullable so ephemeral worker rows (no principal) can coexist
@@ -339,7 +358,10 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     └─────────────────────────────────────────────────────────────┘
 
     In #{inspect(resource)}, configure the BlobIO encryption layer with the
-    `KeyGrants` key manager:
+    `KeyGrants` key manager. `storage do` takes one `layer` entity per
+    layer (there is no `layers [...]` list), and `metadata_key` is the
+    stable identifier persisted in blob metadata — choose it once and
+    never rename it, or existing blobs become unreadable.
 
     use Ash.Resource,
       domain: #{inspect(domain)},
@@ -348,26 +370,32 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     storage do
       service {AshStorage.Service.S3, bucket: "private-blobs"}
 
-      layers [
-        {AshStorage.Layer.Encryption,
-         layer_id: "#{resource_rel_name}-vault",
-         key_manager:
-           {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
-            grants_resource: #{inspect(grants_resource)},
-            domain: #{inspect(domain)},
-            actor_public_key_attribute: :#{actor_public_key_attr},
-            actor_private_key_attribute: :#{actor_private_key_attr},
-            subject_id_attribute: :#{file_id_attr},
-            # Opt-in: time-bounded user grants AND per-attach
-            # ephemeral worker grants for deferred analyzer reads.
-            # Drop these two lines if you only want permanent user
-            # grants and have no `:oban` analyzers. See the
-            # `expiring-grants` topic for the threat model and TTL
-            # guidance.
-            expires_at_attribute: :expires_at,
-            ephemeral_ttl_seconds: 86_400},
-         proxy_base_url: "/storage"}
-      ]
+      # Your AshStorage blob + attachment resources (both required by
+      # the storage DSL). The blob resource is the one the grants table
+      # references (see steps 1 and 2).
+      blob_resource #{inspect(blob_resource)}
+      attachment_resource #{inspect(resource)}Attachment
+
+      layer {AshStorage.Layer.Encryption,
+             key_manager:
+               {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
+                grants_resource: #{inspect(grants_resource)},
+                domain: #{inspect(domain)},
+                actor_public_key_attribute: :#{actor_public_key_attr},
+                actor_private_key_attribute: :#{actor_private_key_attr},
+                subject_id_attribute: :#{file_id_attr},
+                # Opt-in: time-bounded user grants AND per-attach
+                # ephemeral worker grants for deferred analyzer reads.
+                # Drop these two lines if you only want permanent user
+                # grants and have no `:oban` analyzers. See the
+                # `expiring-grants` topic for the threat model and TTL
+                # guidance.
+                expires_at_attribute: :expires_at,
+                ephemeral_ttl_seconds: 86_400},
+             proxy_base_url: "/storage"},
+            metadata_key: "#{resource_rel_name}-vault"
+
+      has_one_attached :#{file_attr}
     end
 
     reconcile do
@@ -377,11 +405,25 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
       key_grants_subject_id_attribute :#{file_id_attr}
       actor_public_key_attribute :#{actor_public_key_attr}
       actor_private_key_attribute :#{actor_private_key_attr}
+
+      # The KeyGrants manager keys grants by the BLOB id (`bctx.blob.id`),
+      # so reconcile must derive the same id from a #{inspect(resource)}
+      # record: walk the `:#{file_attr}` attachment to its `blob_id`.
+      # Without these two lines reconcile looks grants up by the record
+      # id, never finds the manager's rows, and re-issues (or queues
+      # requests for) every pair on every pass. A record with no
+      # attachment yet yields nil and is skipped.
+      subject_load [:#{file_attr}]
+      subject_id_for fn record -> record.#{file_attr} && record.#{file_attr}.blob_id end
     end
 
-    Also add the relationship:
+    Also add the inverse relationship on the BLOB resource
+    (#{inspect(blob_resource)}), pinning `destination_attribute` to the
+    grants FK so it still resolves when `--file-id-attribute` is not the
+    Ash default for that resource:
 
     has_many :key_grants, #{inspect(grants_resource)} do
+      destination_attribute :#{file_id_attr}
       public? true
     end
 
@@ -493,12 +535,14 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
       actor_private_key_attribute: :#{actor_private_key_attr}
     }
 
-    # Share a file with another user (only needs the target's public key):
-    def handle_event("share", %{"doc_id" => doc_id, "target_user_id" => target_user_id}, socket) do
+    # Share a file with another user (only needs the target's public key).
+    # The grant subject is the BLOB id (`document.#{file_attr}.blob_id`), not
+    # the #{inspect(resource)} id — same id the KeyGrants manager keys by.
+    def handle_event("share", %{"blob_id" => blob_id, "target_user_id" => target_user_id}, socket) do
       actor = load_actor_with_keys(socket.assigns.current_user)
       target = load_actor_with_keys(target_user_id)
 
-      case AshEnvelope.KeyGrants.share(@grants_config, doc_id, actor, target, #{inspect(domain)}) do
+      case AshEnvelope.KeyGrants.share(@grants_config, blob_id, actor, target, #{inspect(domain)}) do
         :ok ->
           {:noreply, put_flash(socket, :info, "Access granted")}
 
@@ -535,12 +579,15 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
       end
     end
 
-    # List documents with grants preloaded:
+    # List documents with grants preloaded (grants hang off the blob):
     defp list_documents(user) do
       actor = load_actor_with_keys(user)
       case Ash.read(#{inspect(resource)}, actor: actor, authorize?: true) do
-        {:ok, docs} -> Ash.load!(docs, [key_grants: [:user]], authorize?: false)
-        {:error, _} -> []
+        {:ok, docs} ->
+          Ash.load!(docs, [#{file_attr}: [blob: [key_grants: [:user]]]], authorize?: false)
+
+        {:error, _} ->
+          []
       end
     end
 
@@ -606,14 +653,8 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     """)
   end
 
-  defp infer_file_id_attribute(resource) do
-    resource
-    |> Module.split()
-    |> List.last()
-    |> Macro.underscore()
-    |> Kernel.<>("_id")
-    |> String.to_atom()
-  end
+  defp infer_blob_resource(nil, resource), do: Module.concat([inspect(resource) <> "Blob"])
+  defp infer_blob_resource(blob_str, _resource), do: Igniter.Project.Module.parse(blob_str)
 
   defp infer_table_name(resource) do
     resource

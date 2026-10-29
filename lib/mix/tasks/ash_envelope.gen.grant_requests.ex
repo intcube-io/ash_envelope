@@ -29,9 +29,13 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
   * `--grants-resource` - Module name of the existing key grants resource (required)
   * `--domain` - The Ash domain module (required)
   * `--user-resource` - The user/actor resource module (required)
-  * `--subject-id-attribute` - FK on the requests table pointing at the subject
-    (default: matches the grants resource convention, e.g. `:document_id` /
-    `:blob_id`; inferred from the resource name)
+  * `--blob-resource` - The `AshStorage.BlobResource` module the subject's
+    attachment stores into. Requests are keyed by the blob row, like the
+    grants table (default: inferred from the resource name, e.g.
+    MyApp.Document -> MyApp.DocumentBlob)
+  * `--subject-id-attribute` - FK on the requests table pointing at the blob
+    row. Must match the grants resource / `reconcile do` convention
+    (default: `:blob_id`)
   * `--repo` - The Ecto repo module (default: inferred from domain)
   """
 
@@ -46,6 +50,7 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
         grants_resource: :string,
         domain: :string,
         user_resource: :string,
+        blob_resource: :string,
         subject_id_attribute: :string,
         repo: :string
       ],
@@ -60,17 +65,22 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
     grants_resource = Igniter.Project.Module.parse(igniter.args.options[:grants_resource])
     domain = Igniter.Project.Module.parse(igniter.args.options[:domain])
     user_resource = Igniter.Project.Module.parse(igniter.args.options[:user_resource])
+    blob_resource = infer_blob_resource(igniter.args.options[:blob_resource], resource)
 
+    # Same subject id as the grants table: reconcile passes the grant
+    # subject id (the blob id, see `mix ash_envelope.gen.key_grants`) to
+    # `AshEnvelope.GrantRequests.create/6`, so the FK must reference the
+    # blob table and defaults to the library-wide `:blob_id`.
     subject_id_attr =
       if igniter.args.options[:subject_id_attribute] do
         String.to_atom(igniter.args.options[:subject_id_attribute])
       else
-        infer_subject_id_attribute(resource)
+        :blob_id
       end
 
     repo = infer_repo(igniter.args.options[:repo], domain)
     requests_table = infer_table_name(requests_resource)
-    resource_table = infer_table_name(resource)
+    blob_table = infer_table_name(blob_resource)
     user_table = infer_table_name(user_resource)
 
     igniter
@@ -118,7 +128,10 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
       end
 
       relationships do
-        belongs_to :#{infer_relationship_name(resource)}, #{inspect(resource)} do
+        # Keyed by the BLOB row, exactly like the grants table: reconcile
+        # creates requests with the grant subject id (`blob.id`), never
+        # the #{inspect(resource)} id.
+        belongs_to :blob, #{inspect(blob_resource)} do
           source_attribute :#{subject_id_attr}
           allow_nil? false
           public? true
@@ -209,15 +222,17 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
 
     # ⚠ VERIFY TABLE NAMES — the `references(...)` targets below are
     # inferred from module names by naive pluralization. Check that
-    # "#{resource_table}" and "#{user_table}" match the actual tables of
-    # #{inspect(resource)} and #{inspect(user_resource)} before running.
+    # "#{blob_table}" and "#{user_table}" match the actual tables of
+    # #{inspect(blob_resource)} and #{inspect(user_resource)} before running.
 
     def change do
       create table(:#{requests_table}, primary_key: false) do
         add :id, :uuid, null: false, default: fragment("gen_random_uuid()"), primary_key: true
 
+        # References the BLOB table — the same subject id the grants
+        # table uses.
         add :#{subject_id_attr},
-            references(:#{resource_table}, type: :uuid, on_delete: :delete_all),
+            references(:#{blob_table}, type: :uuid, on_delete: :delete_all),
             null: false
 
         add :user_id,
@@ -321,14 +336,8 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
     """)
   end
 
-  defp infer_subject_id_attribute(resource) do
-    resource
-    |> Module.split()
-    |> List.last()
-    |> Macro.underscore()
-    |> Kernel.<>("_id")
-    |> String.to_atom()
-  end
+  defp infer_blob_resource(nil, resource), do: Module.concat([inspect(resource) <> "Blob"])
+  defp infer_blob_resource(blob_str, _resource), do: Igniter.Project.Module.parse(blob_str)
 
   defp infer_table_name(resource) do
     resource
@@ -336,14 +345,6 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
     |> List.last()
     |> Macro.underscore()
     |> Kernel.<>("s")
-  end
-
-  defp infer_relationship_name(resource) do
-    resource
-    |> Module.split()
-    |> List.last()
-    |> Macro.underscore()
-    |> String.to_atom()
   end
 
   defp infer_repo(nil, domain) do
