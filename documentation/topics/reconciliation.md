@@ -132,6 +132,14 @@ When the action's name isn't listed in the affects entry's `actions`,
 the change is a silent no-op — useful for actions you intentionally
 want to skip.
 
+On an `:update`, `SyncPrincipal` reconciles both the old and the new
+value of `principal` (a reassigned FK revokes the previous holder and
+grants the new one) and evaluates `scope` against both the changed
+changeset and a pre-change view, so a membership moved from org A to
+org B revokes the principal's grants on A's records as well as granting
+B's. Writing `scope` as `get_attribute(cs, …) || get_data(cs, …)`, as
+above, is what makes the pre-change evaluation resolve to the old value.
+
 #### Explicit overrides
 
 Pass `principal:`/`scope:`/`only_when:` directly to the change to
