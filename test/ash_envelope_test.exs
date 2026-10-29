@@ -6,7 +6,7 @@ defmodule AshEnvelopeTest do
   # Flip the lowest bit of the byte at `byte_index`, leaving the rest of
   # the binary untouched — the smallest possible tamper.
   defp flip_bit(binary, byte_index) do
-    <<prefix::binary-size(byte_index), byte, rest::binary>> = binary
+    <<prefix::binary-size(^byte_index), byte, rest::binary>> = binary
     <<prefix::binary, bxor(byte, 1), rest::binary>>
   end
 

@@ -18,8 +18,6 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
   alias AshEnvelope.BlobIO.Backup
   alias AshStorage.BlobIO.Support
 
-  require Ash.Query
-
   @encryption_format "aes-256-gcm"
 
   @typedoc "Reason a blob can be skipped or rejected by rotation."
@@ -182,7 +180,7 @@ defmodule AshEnvelope.BlobIO.BackupRotation do
           layer_chain = layer_chain(fresh_blob.metadata)
           new_layer_chain = List.replace_at(layer_chain, layer_index, new_layer_entry)
 
-          new_metadata = Support.put_layer_metadata(fresh_blob.metadata || %{}, new_layer_chain)
+          new_metadata = Support.put_layer_metadata(fresh_blob.metadata, new_layer_chain)
 
           Ash.update(
             fresh_blob,

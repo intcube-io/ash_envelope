@@ -33,7 +33,6 @@ defmodule AshEnvelope.Reconcile.Changes.SyncSubject do
 
   alias AshEnvelope.Reconcile.{Info, Runner}
 
-  require Ash.Query
   require Logger
 
   @impl true

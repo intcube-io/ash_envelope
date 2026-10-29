@@ -63,7 +63,6 @@ defmodule AshEnvelope.Reconcile.Granter do
   alias AshEnvelope.{GrantRequests, KeyGrants}
   alias AshEnvelope.Reconcile.Context
 
-  require Ash.Query
   require Logger
 
   @type result :: :ok | :skip | {:error, term()}

@@ -61,7 +61,9 @@ defmodule AshEnvelope.SealKeyTest do
     end
 
     test "rejects non-binary input" do
-      assert_raise FunctionClauseError, fn -> SealKey.seal(:not_a_binary) end
+      # apply/3 keeps the deliberately ill-typed call out of the compile-time type checker.
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
+      assert_raise FunctionClauseError, fn -> apply(SealKey, :seal, [:not_a_binary]) end
     end
   end
 

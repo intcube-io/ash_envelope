@@ -11,5 +11,7 @@ defmodule AshEnvelope.Test.Domain do
     resource AshEnvelope.Test.TestHelpers.EmptyPoliciesResource
     resource AshEnvelope.Test.TestHelpers.WithPoliciesResource
     resource AshEnvelope.Test.TestHelpers.PartialCoverageResource
+    resource AshEnvelope.Test.TestHelpers.WideOpenResource
+    resource AshEnvelope.Test.TestHelpers.PermissiveBypassResource
   end
 end

@@ -226,9 +226,9 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     end
 
     encrypted = ctx.encrypted_resource
-    queue = ok_or(Info.reconcile_oban_queue(encrypted), :ash_envelope_reconcile)
-    chunk_size = ok_or(Info.reconcile_oban_chunk_size(encrypted), 5000)
-    oban_name = ok_or(Info.reconcile_oban_name(encrypted), Oban)
+    queue = Info.reconcile_oban_queue!(encrypted)
+    chunk_size = Info.reconcile_oban_chunk_size!(encrypted)
+    oban_name = Info.reconcile_oban_name!(encrypted)
     actor_id = ctx.actor && Map.get(ctx.actor, :id)
 
     # Struct tenants (context multitenancy) don't survive a JSON
@@ -283,9 +283,6 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
         fun.(args, queue)
     end
   end
-
-  defp ok_or({:ok, value}, _default), do: value
-  defp ok_or(_, default), do: default
 
   # The scope is a function of the changeset, so on an `:update` that
   # changes an attribute the scope depends on (a membership reassigned

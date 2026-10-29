@@ -252,7 +252,6 @@ defmodule AshEnvelope.LogSafetyTest do
     end
 
     defp wrap_normalize({:ok, wrapped}), do: {:ok, wrapped, :none}
-    defp wrap_normalize({:ok, wrapped, handoff}), do: {:ok, wrapped, {:handoff, handoff}}
     defp wrap_normalize(other), do: other
   end
 end

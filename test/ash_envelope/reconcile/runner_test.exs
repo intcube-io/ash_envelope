@@ -518,7 +518,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
   describe "plan/2" do
     alias AshEnvelope.Reconcile.Plan
 
-    test "lists pairs that should-grant under :grants", ctx do
+    test "lists pairs that should-grant under :grants", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -533,7 +533,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert grant.target.id == target.id
     end
 
-    test "lists pairs that should-revoke under :revocations", ctx do
+    test "lists pairs that should-revoke under :revocations", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -550,7 +550,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert revocation.subject_id == doc.id
     end
 
-    test "no-op pairs produce an empty plan", ctx do
+    test "no-op pairs produce an empty plan", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -561,7 +561,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert Plan.empty?(plan)
     end
 
-    test "writes nothing — calling plan/2 doesn't touch the grants table", ctx do
+    test "writes nothing — calling plan/2 doesn't touch the grants table", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -578,7 +578,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
   describe "apply_plan!/3" do
     alias AshEnvelope.Reconcile.Plan
 
-    test "executes the same writes as run/2", ctx do
+    test "executes the same writes as run/2", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -594,12 +594,12 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert {:ok, %_{}} = grant_for(target, doc)
     end
 
-    test "returns :ok on an empty plan without raising", ctx do
+    test "returns :ok on an empty plan without raising", _ctx do
       reconcile_ctx = build_context(make_user(:user))
       assert :ok = Runner.apply_plan!(reconcile_ctx, %Plan{})
     end
 
-    test "transaction: false bypasses the wrapper (smoke)", ctx do
+    test "transaction: false bypasses the wrapper (smoke)", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
