@@ -72,6 +72,10 @@ defmodule AshEnvelope do
   for the rationale and the threat model these primitives cover.
   """
 
+  @aes_256_gcm_iv_bytes 12
+  @aes_256_gcm_tag_bytes 16
+  @dek_bytes 32
+
   # -- Field encryption (AES-256-GCM with optional AAD) --
 
   @doc """
@@ -344,6 +348,13 @@ defmodule AshEnvelope do
 
   Same limitation as `recover_dek/2`: exactly one encryption layer, no
   other layered transforms.
+
+  The persisted `"iv"` and `"tag"` must decode to exactly 12 and 16
+  bytes, mirroring `AshStorage.Layer.Encryption`'s read path. Anything
+  else returns `{:error, {:invalid_encryption_layer_metadata, key}}`
+  rather than being handed to the AEAD, where a shortened tag would
+  weaken authentication. A backup wrap that does not yield a 32-byte DEK
+  returns `{:error, :decryption_failed}`.
   """
   @spec recover_plaintext(map() | struct(), binary(), binary()) ::
           {:ok, binary()} | {:error, term()}
@@ -353,8 +364,9 @@ defmodule AshEnvelope do
          {:ok, layer_metadata_key, layer_metadata} <- single_encryption_layer_entry(blob),
          {:ok, backup_wrap} <- fetch_backup_wrap(layer_metadata),
          {:ok, dek} <- AshEnvelope.BlobIO.Backup.unwrap_backup(backup_wrap, backup_private_key),
-         {:ok, iv} <- decode_base64(layer_metadata, "iv"),
-         {:ok, tag} <- decode_base64(layer_metadata, "tag") do
+         :ok <- validate_dek_length(dek),
+         {:ok, iv} <- decode_fixed(layer_metadata, "iv", @aes_256_gcm_iv_bytes),
+         {:ok, tag} <- decode_fixed(layer_metadata, "tag", @aes_256_gcm_tag_bytes) do
       aad = aes_256_gcm_aad(blob_key, layer_metadata_key)
 
       case :crypto.crypto_one_time_aead(:aes_256_gcm, dek, iv, ciphertext, aad, tag, false) do
@@ -363,6 +375,9 @@ defmodule AshEnvelope do
       end
     end
   end
+
+  defp validate_dek_length(dek) when byte_size(dek) == @dek_bytes, do: :ok
+  defp validate_dek_length(_dek), do: {:error, :decryption_failed}
 
   defp single_encryption_layer(blob_or_metadata) do
     with {:ok, _layer_metadata_key, metadata} <- single_encryption_layer_entry(blob_or_metadata) do
@@ -425,16 +440,17 @@ defmodule AshEnvelope do
 
   defp fetch_backup_wrap(_), do: {:error, :no_backup_wrap}
 
-  defp decode_base64(metadata, key) do
-    case Map.fetch(metadata, key) do
-      {:ok, value} when is_binary(value) ->
-        case Base.decode64(value) do
-          {:ok, decoded} -> {:ok, decoded}
-          :error -> {:error, {:invalid_encryption_layer_metadata, key}}
-        end
-
-      _ ->
-        {:error, {:invalid_encryption_layer_metadata, key}}
+  # Decode a base64 metadata field and enforce its exact byte length, as
+  # AshStorage.Layer.Encryption does on read. AES-GCM accepts tags of
+  # any length up to 16 bytes, so an unchecked tag field would let a
+  # metadata writer shorten the tag and make forgeries cheap.
+  defp decode_fixed(metadata, key, expected_size) do
+    with {:ok, value} when is_binary(value) <- Map.fetch(metadata, key),
+         {:ok, decoded} <- Base.decode64(value),
+         true <- byte_size(decoded) == expected_size do
+      {:ok, decoded}
+    else
+      _missing_or_invalid -> {:error, {:invalid_encryption_layer_metadata, key}}
     end
   end
 end
