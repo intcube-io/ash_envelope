@@ -1,5 +1,8 @@
 defmodule AshEnvelope.Test.TestHelpers.WithPoliciesResource do
   @moduledoc false
+  # Baseline "correctly configured" fixture: authorizer, a policy that
+  # covers every action type, and a check that actually restricts who
+  # may act (so strict permissive-coverage detection passes).
 
   use Ash.Resource,
     domain: AshEnvelope.Test.Domain,
@@ -21,7 +24,7 @@ defmodule AshEnvelope.Test.TestHelpers.WithPoliciesResource do
 
   policies do
     policy always() do
-      authorize_if always()
+      authorize_if actor_present()
     end
   end
 end
