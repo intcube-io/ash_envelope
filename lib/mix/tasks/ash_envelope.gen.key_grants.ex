@@ -595,8 +595,8 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
     │ 8. EXPIRY / EPHEMERAL — set the seal key + schedule purge  │
     └─────────────────────────────────────────────────────────────┘
 
-    Skip this section if you removed the four `*_attribute` opts on
-    the key manager. Otherwise:
+    Skip this section if you removed `expires_at_attribute` (and
+    `ephemeral_ttl_seconds`) from the key manager opts. Otherwise:
 
     1. Generate a 32-byte seal key once and store it in your secrets
        store:
@@ -608,9 +608,9 @@ defmodule Mix.Tasks.AshEnvelope.Gen.KeyGrants do
          config :ash_envelope,
            seal_key: System.fetch_env!("ASH_ENVELOPE_SEAL_KEY")
 
-       The seal key never decrypts a blob directly — it only unlocks
-       the sealed private half of each ephemeral grant row, and that
-       row's wrapped DEK is what actually decrypts the blob.
+       The seal key never decrypts a blob directly — it only opens
+       the sealed DEK stored on each ephemeral grant row (AAD-bound to
+       that row's subject id), and that DEK is what decrypts the blob.
 
     3. Schedule a TTL purge job. Both time-bounded user grants and
        ephemeral worker grants live in the same table, both surface

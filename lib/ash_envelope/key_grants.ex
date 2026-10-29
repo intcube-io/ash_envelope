@@ -375,7 +375,7 @@ defmodule AshEnvelope.KeyGrants do
 
   @doc """
   Replace the ephemeral row for `subject_id` with a freshly minted
-  one (new keypair, new sealed private half, new TTL).
+  one (fresh seal of the DEK, new TTL).
 
   Lower-level than `renew_ephemeral_with_actor/5`. The caller is
   responsible for supplying the correct `raw_dek` — this function has

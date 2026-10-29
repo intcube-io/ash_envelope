@@ -2,10 +2,10 @@ defmodule AshEnvelope.SealKey do
   @moduledoc """
   Symmetric seal/unseal under an operator-managed key.
 
-  Used by `AshEnvelope.KeyGrants` to seal per-row ephemeral X25519
-  private keys at rest (the worker-pathway use case). The seal key
-  never decrypts a blob directly — it only unlocks ephemeral private
-  keys, which in turn unwrap a wrapped DEK from the grant row.
+  Used by `AshEnvelope.KeyGrants` to seal the DEK stored on ephemeral
+  worker grant rows at rest (AAD = subject id; the worker-pathway use
+  case). The seal key never decrypts a blob directly — it only opens
+  the sealed DEK on an ephemeral row, and that DEK decrypts the blob.
   Together with `expires_at` TTL purge, this bounds the worker
   pathway's blast radius to "blobs whose analyzer pipeline is
   currently in flight."

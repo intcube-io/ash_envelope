@@ -3,7 +3,7 @@
 `AshEnvelope.KeyGrants` supports two kinds of time-bounded access on the same grants table:
 
 - **Time-bounded user grants** — a regular user grant with an `expires_at` deadline. Reads stop succeeding past the deadline; a TTL purge eventually removes the row. Useful for guest links, trial access, time-boxed audits, break-glass admin grants.
-- **Ephemeral worker grants** — a row with no `user_id`, carrying an X25519 keypair on the row itself (private half sealed under an operator-managed seal key). Lets deferred Oban analyzers decrypt without a user actor in scope.
+- **Ephemeral worker grants** — a row with no `user_id`, carrying the DEK sealed directly under an operator-managed seal key (`AshEnvelope.SealKey`, AAD = subject id). Lets deferred Oban analyzers decrypt without a user actor in scope.
 
 Both share the same `expires_at` column and the same cron-purge query. Choose whichever your use case fits.
 
@@ -88,18 +88,18 @@ Accepted formats: a raw 32-byte binary or a base64-encoded string that decodes t
 
 ### Threat model for the seal key
 
-The seal key is not itself a decrypt key. It only unlocks sealed private halves of ephemeral grant rows that still exist. The blast radius of each compromise:
+The seal key does not decrypt any blob by itself. It only opens the sealed DEKs of ephemeral grant rows that still exist. The blast radius of each compromise:
 
 | What leaks | What attacker can decrypt |
 | --- | --- |
 | Env seal key, alone | Nothing — no rows to unseal without DB access |
 | Env seal key + DB read | Only blobs with a live ephemeral grant row (currently in flight) |
-| Env seal key + DB write | Same as above. AAD on the sealed private key prevents row-relocation attacks. |
+| Env seal key + DB write | Same as above. AAD on the sealed DEK prevents row-relocation attacks. |
 | A user's X25519 private key | The blobs that user has grants for. Independent of the worker pathway. |
 
 Three properties combine to give this its shape:
 
-1. **Per-attach key**, not per-application. A compromised ephemeral private key unlocks one blob.
+1. **Per-attach row**, not per-application. Each sealed value opens exactly one blob's DEK.
 2. **Sealed at rest** with AAD bound to the subject id. A sealed value lifted into a different row's column fails to unseal.
 3. **TTL-bounded**. The lifetime of the worker capability for a blob is finite by design.
 
@@ -196,4 +196,4 @@ Cheap, idempotent, every-minute cadence is fine. Run as an Oban cron.
 
 ## When the worker pathway is disabled
 
-If you omit the four `*_attribute` opts on the manager, no ephemeral rows are created at attach and the `unwrap_dek` discriminator never enters the ephemeral path. The manager behaves exactly as before, and deferred analyzers continue to fail with `:missing_principal` — restricting you to `analyze: :eager` analyzers that run with the user actor in scope during attach.
+If you omit `:expires_at_attribute` (and `:ephemeral_ttl_seconds`) on the manager, no ephemeral rows are created at attach and the `unwrap_dek` discriminator never enters the ephemeral path. The manager behaves exactly as before, and deferred analyzers continue to fail with `:missing_principal` — restricting you to `analyze: :eager` analyzers that run with the user actor in scope during attach.
