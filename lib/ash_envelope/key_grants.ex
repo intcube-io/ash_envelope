@@ -75,6 +75,14 @@ defmodule AshEnvelope.KeyGrants do
 
   Every one of these accepts an `opts[:actor]` override when a
   distinct authorization actor is required.
+
+  ## Multitenancy
+
+  Every public function also accepts `opts[:tenant]`, forwarded to each
+  underlying Ash call (lookups, creates, the expired-row purge in
+  `share/6`, and the ephemeral destroy/restore path) so attribute- and
+  context-multitenant grants resources work. `nil` (the default)
+  preserves single-tenant behavior.
   """
 
   alias AshEnvelope.KeyGrants.Config
@@ -121,6 +129,7 @@ defmodule AshEnvelope.KeyGrants do
         Ash.create(config.resource, attrs,
           domain: domain,
           actor: Keyword.get(opts, :actor, actor),
+          tenant: Keyword.get(opts, :tenant),
           authorize?: config.authorize?
         )
 
@@ -172,6 +181,7 @@ defmodule AshEnvelope.KeyGrants do
         read_opts = [
           domain: domain,
           actor: Keyword.get(opts, :actor, actor),
+          tenant: Keyword.get(opts, :tenant),
           authorize?: config.authorize?
         ]
 
@@ -209,7 +219,9 @@ defmodule AshEnvelope.KeyGrants do
   created.
 
   `opts[:expires_at]` is forwarded to `create_for_actor/6` if the
-  target needs a fresh grant.
+  target needs a fresh grant. `opts[:tenant]` is forwarded to the
+  granting-side resolve, the target-side existence check, the expired-row
+  purge, and the grant create.
 
   **Authorization:** the granting-side resolve and the grant create
   run with the calling `actor` (override the create's actor via
@@ -226,7 +238,8 @@ defmodule AshEnvelope.KeyGrants do
         {:error, :missing_principal}
 
       target_id ->
-        with {:ok, raw_dek} <- resolve_for_actor(config, subject_id, actor, domain) do
+        with {:ok, raw_dek} <-
+               resolve_for_actor(config, subject_id, actor, domain, Keyword.take(opts, [:tenant])) do
           do_share(config, subject_id, raw_dek, actor, target_actor, target_id, domain, opts)
         end
     end
@@ -234,13 +247,14 @@ defmodule AshEnvelope.KeyGrants do
 
   defp do_share(config, subject_id, raw_dek, actor, target_actor, target_id, domain, opts) do
     create_opts = Keyword.put_new(opts, :actor, actor)
+    tenant = Keyword.get(opts, :tenant)
 
-    case target_grant_active?(config, subject_id, target_actor, domain) do
+    case target_grant_active?(config, subject_id, target_actor, domain, tenant) do
       {:ok, true} ->
         :ok
 
       {:ok, false} ->
-        with :ok <- purge_expired_grants_for(config, subject_id, target_id, domain) do
+        with :ok <- purge_expired_grants_for(config, subject_id, target_id, domain, tenant) do
           case create_for_actor(config, subject_id, raw_dek, target_actor, domain, create_opts) do
             :ok ->
               :ok
@@ -249,7 +263,7 @@ defmodule AshEnvelope.KeyGrants do
               # A concurrent share may have won the race against the
               # grants unique identity. Re-check before reporting the
               # failure so duplicate-key conflicts surface as :ok.
-              case target_grant_active?(config, subject_id, target_actor, domain) do
+              case target_grant_active?(config, subject_id, target_actor, domain, tenant) do
                 {:ok, true} -> :ok
                 _ -> err
               end
@@ -276,6 +290,7 @@ defmodule AshEnvelope.KeyGrants do
     Ash.destroy(grant_record,
       domain: domain,
       actor: actor,
+      tenant: Keyword.get(opts, :tenant),
       authorize?: Keyword.get(opts, :authorize?, true)
     )
   end
@@ -333,6 +348,7 @@ defmodule AshEnvelope.KeyGrants do
     Ash.create(config.resource, attrs,
       domain: domain,
       actor: Keyword.get(opts, :actor),
+      tenant: Keyword.get(opts, :tenant),
       authorize?: config.authorize?
     )
   end
@@ -370,6 +386,7 @@ defmodule AshEnvelope.KeyGrants do
     read_opts = [
       domain: domain,
       actor: Keyword.get(opts, :actor),
+      tenant: Keyword.get(opts, :tenant),
       authorize?: config.authorize?
     ]
 
@@ -453,7 +470,8 @@ defmodule AshEnvelope.KeyGrants do
   @spec renew_ephemeral_with_actor(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, Ash.Resource.record()} | {:error, term()}
   def renew_ephemeral_with_actor(%Config{} = config, subject_id, actor, domain, opts \\ []) do
-    with {:ok, dek} <- resolve_for_actor(config, subject_id, actor, domain) do
+    with {:ok, dek} <-
+           resolve_for_actor(config, subject_id, actor, domain, Keyword.take(opts, [:tenant])) do
       renew_ephemeral(config, subject_id, dek, domain, Keyword.put_new(opts, :actor, actor))
     end
   end
@@ -511,14 +529,19 @@ defmodule AshEnvelope.KeyGrants do
   # Runs with the target as the Ash actor (it reads the target's own
   # rows) and never needs the target's private key, so it stays safe
   # for targets loaded with only their public key.
-  defp target_grant_active?(%Config{} = config, subject_id, target_actor, domain) do
+  defp target_grant_active?(%Config{} = config, subject_id, target_actor, domain, tenant) do
     query =
       config.resource
       |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
       |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id(target_actor)}])
       |> Ash.Query.select(select_grant_existence(config))
 
-    case Ash.read(query, domain: domain, actor: target_actor, authorize?: config.authorize?) do
+    case Ash.read(query,
+           domain: domain,
+           actor: target_actor,
+           tenant: tenant,
+           authorize?: config.authorize?
+         ) do
       {:ok, rows} -> {:ok, Enum.any?(rows, &(check_not_expired(&1, config) == :ok))}
       {:error, _} = err -> err
     end
@@ -537,11 +560,17 @@ defmodule AshEnvelope.KeyGrants do
   # filter them out. Purging them here mirrors the system-side TTL
   # purge job (hence authorize?: false) and keeps re-sharing from
   # colliding with the scaffolded (subject, user_id) unique index.
-  defp purge_expired_grants_for(%Config{expires_at_attribute: nil}, _subject_id, _pid, _domain) do
+  defp purge_expired_grants_for(
+         %Config{expires_at_attribute: nil},
+         _subject_id,
+         _pid,
+         _domain,
+         _tenant
+       ) do
     :ok
   end
 
-  defp purge_expired_grants_for(%Config{} = config, subject_id, target_id, domain) do
+  defp purge_expired_grants_for(%Config{} = config, subject_id, target_id, domain, tenant) do
     expires_ref = ref(config.expires_at_attribute)
 
     config.resource
@@ -552,6 +581,7 @@ defmodule AshEnvelope.KeyGrants do
       :destroy,
       %{},
       domain: domain,
+      tenant: tenant,
       authorize?: false,
       return_errors?: true,
       strategy: [:atomic, :stream]
@@ -574,6 +604,7 @@ defmodule AshEnvelope.KeyGrants do
     read_opts = [
       domain: domain,
       actor: Keyword.get(opts, :actor),
+      tenant: Keyword.get(opts, :tenant),
       authorize?: config.authorize?
     ]
 
@@ -599,6 +630,7 @@ defmodule AshEnvelope.KeyGrants do
     Ash.create(config.resource, attrs,
       domain: domain,
       actor: Keyword.get(opts, :actor),
+      tenant: Keyword.get(opts, :tenant),
       authorize?: config.authorize?
     )
 
@@ -616,6 +648,7 @@ defmodule AshEnvelope.KeyGrants do
       %{},
       domain: domain,
       actor: Keyword.get(opts, :actor),
+      tenant: Keyword.get(opts, :tenant),
       authorize?: config.authorize?,
       return_errors?: true,
       strategy: [:atomic, :stream]

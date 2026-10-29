@@ -14,6 +14,13 @@ if Code.ensure_loaded?(Oban) do
       `nil` when the trigger had no actor; the worker then falls through
       strategies that need actor-side key material)
     - `"subject_ids"` — list of encrypted-resource primary keys
+    - `"tenant"` — tenant of the triggering changeset (may be `nil` for
+      single-tenant hosts). The trigger serializes it via
+      `Ash.ToTenant.to_tenant/2`, so struct tenants (context
+      multitenancy) are reduced to their primitive representation before
+      enqueue. Hosts using context multitenancy must make sure that
+      value survives a JSON round-trip (string/integer) and is accepted
+      as a tenant by every resource the runner touches.
 
     No key material rides in the args. The actor's private key lives in
     the user table (cloak-encrypted at rest); the worker re-decrypts it
@@ -65,6 +72,9 @@ if Code.ensure_loaded?(Oban) do
       # Always succeeds for a resource that compiled: the required
       # `reconcile do` fields are enforced by ValidateConfig.
       {:ok, base_ctx} = Info.context(encrypted)
+      # Restore the tenant before loading anything so the actor
+      # re-load (and everything the runner does) stays tenant-scoped.
+      base_ctx = %{base_ctx | tenant: args["tenant"]}
 
       actor = load_actor_arg(base_ctx, args["actor_id"])
       principal_id = cast_id(encrypted, args["principal_id"])
@@ -124,6 +134,7 @@ if Code.ensure_loaded?(Oban) do
     defp load_actor(ctx, actor_id) do
       case Ash.get(ctx.user_resource, actor_id,
              domain: ctx.domain,
+             tenant: ctx.tenant,
              authorize?: false,
              load: ctx.user_load
            ) do

@@ -180,7 +180,7 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
       ids ->
         with {:ok, ctx} <- Info.context(encrypted),
-             ctx = %{ctx | actor: actor, changeset: cs},
+             ctx = %{ctx | actor: actor, changeset: cs, tenant: cs.tenant},
              {:ok, subjects} <- enumerate_scope_subjects(ctx, scope, cs) do
           pairs = for id <- ids, subject <- subjects, do: {id, subject}
           execute(Mode.resolve(opts, encrypted), ctx, pairs, result)
@@ -231,6 +231,11 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     oban_name = ok_or(Info.reconcile_oban_name(encrypted), Oban)
     actor_id = ctx.actor && Map.get(ctx.actor, :id)
 
+    # Struct tenants (context multitenancy) don't survive a JSON
+    # round-trip; serialize the primitive via `Ash.ToTenant` and let the
+    # worker put it back on the rebuilt context.
+    tenant = Ash.ToTenant.to_tenant(ctx.tenant, encrypted)
+
     # Pairs may now span multiple principals (e.g. an `:update` that
     # reassigns the FK reconciles both old and new). Group by principal_id
     # so each Oban job carries one principal + its subject ids.
@@ -245,7 +250,8 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
           "encrypted_resource" => Atom.to_string(encrypted),
           "principal_id" => principal_id,
           "actor_id" => actor_id,
-          "subject_ids" => chunk
+          "subject_ids" => chunk,
+          "tenant" => tenant
         }
 
         enqueue(args, queue, oban_name)
@@ -364,7 +370,12 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     try do
       list =
         query
-        |> Ash.stream!(domain: ctx.domain, authorize?: false, batch_size: 500)
+        |> Ash.stream!(
+          domain: ctx.domain,
+          tenant: ctx.tenant,
+          authorize?: false,
+          batch_size: 500
+        )
         |> Enum.take(max + 1)
 
       if length(list) > max do

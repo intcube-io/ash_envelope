@@ -47,6 +47,13 @@ defmodule AshEnvelope.GrantRequests do
 
   Where an `opts[:actor]` override exists it takes precedence.
 
+  ## Multitenancy
+
+  Every public function accepts `opts[:tenant]` (`fulfill_outstanding/6`
+  as an optional trailing keyword list), forwarded to each underlying
+  Ash call, including the `KeyGrants.share/6` re-wrap inside
+  `fulfill/7`. `nil` (the default) preserves single-tenant behavior.
+
   ## Usage
 
       requests_config = %AshEnvelope.GrantRequests.Config{
@@ -114,8 +121,9 @@ defmodule AshEnvelope.GrantRequests do
 
   defp do_create(config, subject_id, target_id, requested_by_actor, domain, opts) do
     authz_actor = Keyword.get(opts, :actor, requested_by_actor)
+    tenant = Keyword.get(opts, :tenant)
 
-    case lookup_pending(config, subject_id, target_id, domain, authz_actor) do
+    case lookup_pending(config, subject_id, target_id, domain, authz_actor, tenant) do
       {:ok, %_{}} ->
         :ok
 
@@ -137,6 +145,7 @@ defmodule AshEnvelope.GrantRequests do
           Ash.create(config.resource, attrs,
             domain: domain,
             actor: authz_actor,
+            tenant: tenant,
             authorize?: config.authorize?
           )
 
@@ -148,7 +157,7 @@ defmodule AshEnvelope.GrantRequests do
             # A concurrent create may have won the race against the
             # `unique_pending` identity. Re-check before reporting the
             # failure so duplicate-key conflicts surface as :ok (idempotent).
-            case lookup_pending(config, subject_id, target_id, domain, authz_actor) do
+            case lookup_pending(config, subject_id, target_id, domain, authz_actor, tenant) do
               {:ok, %_{}} -> :ok
               _ -> err
             end
@@ -173,6 +182,7 @@ defmodule AshEnvelope.GrantRequests do
     |> Ash.read(
       domain: domain,
       actor: Keyword.get(opts, :actor),
+      tenant: Keyword.get(opts, :tenant),
       authorize?: config.authorize?
     )
   end
@@ -204,12 +214,20 @@ defmodule AshEnvelope.GrantRequests do
 
       actor_id ->
         authz_actor = Keyword.get(opts, :actor, actor)
-        do_list_fulfillable_for(config, grants_config, actor_id, authz_actor, domain)
+
+        do_list_fulfillable_for(
+          config,
+          grants_config,
+          actor_id,
+          authz_actor,
+          domain,
+          Keyword.get(opts, :tenant)
+        )
     end
   end
 
-  defp do_list_fulfillable_for(config, grants_config, actor_id, authz_actor, domain) do
-    with {:ok, grants} <- list_actor_grants(grants_config, actor_id, authz_actor, domain) do
+  defp do_list_fulfillable_for(config, grants_config, actor_id, authz_actor, domain, tenant) do
+    with {:ok, grants} <- list_actor_grants(grants_config, actor_id, authz_actor, domain, tenant) do
       actor_subject_ids =
         grants
         |> Enum.map(&Map.get(&1, grants_config.subject_id_attribute))
@@ -229,7 +247,12 @@ defmodule AshEnvelope.GrantRequests do
             |> Ash.Query.filter(^[{target_attr, [not_eq: actor_id]}])
             |> filter_pending(config)
 
-          Ash.read(query, domain: domain, actor: authz_actor, authorize?: config.authorize?)
+          Ash.read(query,
+            domain: domain,
+            actor: authz_actor,
+            tenant: tenant,
+            authorize?: config.authorize?
+          )
       end
     end
   end
@@ -292,9 +315,12 @@ defmodule AshEnvelope.GrantRequests do
     authz_actor = Keyword.get(opts, :actor, actor)
     subject_id = Map.get(request, config.subject_id_attribute)
 
-    get_opts = [domain: domain, actor: authz_actor, authorize?: config.authorize?]
+    tenant = Keyword.get(opts, :tenant)
 
-    with :ok <- KeyGrants.share(grants_config, subject_id, actor, target_actor, domain),
+    get_opts = [domain: domain, actor: authz_actor, tenant: tenant, authorize?: config.authorize?]
+
+    with :ok <-
+           KeyGrants.share(grants_config, subject_id, actor, target_actor, domain, tenant: tenant),
          {:ok, fresh} <- Ash.get(config.resource, request.id, get_opts),
          :ok <- ensure_pending(fresh, config) do
       attrs = %{
@@ -306,6 +332,7 @@ defmodule AshEnvelope.GrantRequests do
         Ash.update(fresh, attrs,
           domain: domain,
           actor: authz_actor,
+          tenant: tenant,
           authorize?: config.authorize?
         )
 
@@ -339,13 +366,18 @@ defmodule AshEnvelope.GrantRequests do
 
   **Authorization:** policies see the fulfilling `actor` for every read,
   create, and update along the way.
+
+  `opts[:tenant]` is forwarded to the listing read and to every
+  `fulfill/7` call; `target_loader` is responsible for loading the
+  target in the right tenant.
   """
   @spec fulfill_outstanding(
           Config.t(),
           KeyGrants.Config.t(),
           term(),
           module(),
-          (term() -> {:ok, term()} | {:error, term()})
+          (term() -> {:ok, term()} | {:error, term()}),
+          keyword()
         ) ::
           {non_neg_integer(), non_neg_integer()}
   def fulfill_outstanding(
@@ -353,17 +385,28 @@ defmodule AshEnvelope.GrantRequests do
         %KeyGrants.Config{} = grants_config,
         actor,
         domain,
-        target_loader
+        target_loader,
+        opts \\ []
       )
       when is_function(target_loader, 1) do
-    case list_fulfillable_for(config, grants_config, actor, domain) do
+    tenant_opts = Keyword.take(opts, [:tenant])
+
+    case list_fulfillable_for(config, grants_config, actor, domain, tenant_opts) do
       {:ok, requests} ->
         Enum.reduce(requests, {0, 0}, fn request, {ok, err} ->
           target_id = Map.get(request, config.target_principal_id_attribute)
 
           case target_loader.(target_id) do
             {:ok, target_actor} ->
-              case fulfill(config, grants_config, request, actor, target_actor, domain) do
+              case fulfill(
+                     config,
+                     grants_config,
+                     request,
+                     actor,
+                     target_actor,
+                     domain,
+                     tenant_opts
+                   ) do
                 :ok -> {ok + 1, err}
                 {:error, _} -> {ok, err + 1}
               end
@@ -404,16 +447,22 @@ defmodule AshEnvelope.GrantRequests do
   def revoke_pending_for(%Config{} = config, subject_id, target_id, domain, opts \\ []) do
     actor = Keyword.get(opts, :actor)
     authorize? = Keyword.get(opts, :authorize?, config.authorize?)
+    tenant = Keyword.get(opts, :tenant)
 
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
-    |> Ash.read(domain: domain, actor: actor, authorize?: authorize?)
+    |> Ash.read(domain: domain, actor: actor, tenant: tenant, authorize?: authorize?)
     |> case do
       {:ok, requests} ->
         Enum.reduce_while(requests, {:ok, 0}, fn req, {:ok, count} ->
-          case Ash.destroy(req, domain: domain, actor: actor, authorize?: authorize?) do
+          case Ash.destroy(req,
+                 domain: domain,
+                 actor: actor,
+                 tenant: tenant,
+                 authorize?: authorize?
+               ) do
             :ok -> {:cont, {:ok, count + 1}}
             {:ok, _} -> {:cont, {:ok, count + 1}}
             {:error, _} = err -> {:halt, err}
@@ -427,13 +476,13 @@ defmodule AshEnvelope.GrantRequests do
 
   # ---- private ----
 
-  defp lookup_pending(config, subject_id, target_id, domain, actor) do
+  defp lookup_pending(config, subject_id, target_id, domain, actor, tenant) do
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
     |> Ash.Query.limit(1)
-    |> Ash.read(domain: domain, actor: actor, authorize?: config.authorize?)
+    |> Ash.read(domain: domain, actor: actor, tenant: tenant, authorize?: config.authorize?)
     |> case do
       {:ok, [row | _]} -> {:ok, row}
       {:ok, []} -> {:ok, nil}
@@ -441,11 +490,16 @@ defmodule AshEnvelope.GrantRequests do
     end
   end
 
-  defp list_actor_grants(grants_config, actor_id, authz_actor, domain) do
+  defp list_actor_grants(grants_config, actor_id, authz_actor, domain, tenant) do
     grants_config.resource
     |> Ash.Query.filter(^[{grants_config.principal_id_attribute, actor_id}])
     |> Ash.Query.select([grants_config.subject_id_attribute])
-    |> Ash.read(domain: domain, actor: authz_actor, authorize?: grants_config.authorize?)
+    |> Ash.read(
+      domain: domain,
+      actor: authz_actor,
+      tenant: tenant,
+      authorize?: grants_config.authorize?
+    )
   end
 
   defp filter_pending(query, config) do

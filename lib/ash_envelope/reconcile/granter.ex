@@ -145,7 +145,8 @@ defmodule AshEnvelope.Reconcile.Granter do
                 subject_id,
                 raw_dek,
                 target,
-                ctx.domain
+                ctx.domain,
+                tenant: ctx.tenant
               )
           end
       end
@@ -187,9 +188,9 @@ defmodule AshEnvelope.Reconcile.Granter do
   defp share_from_actor(ctx, subject_id, actor, target) do
     config = ctx.key_grants_config
 
-    case KeyGrants.resolve_for_actor(config, subject_id, actor, ctx.domain) do
+    case KeyGrants.resolve_for_actor(config, subject_id, actor, ctx.domain, tenant: ctx.tenant) do
       {:ok, _raw_dek} ->
-        case KeyGrants.share(config, subject_id, actor, target, ctx.domain) do
+        case KeyGrants.share(config, subject_id, actor, target, ctx.domain, tenant: ctx.tenant) do
           :ok -> :ok
           {:error, :not_found} -> :skip
           {:error, _} = err -> err
@@ -229,6 +230,7 @@ defmodule AshEnvelope.Reconcile.Granter do
          {:ok, reloaded} <-
            Ash.get(ctx.user_resource, id,
              domain: ctx.domain,
+             tenant: ctx.tenant,
              authorize?: false,
              load: ctx.user_load
            ) do
@@ -250,7 +252,8 @@ defmodule AshEnvelope.Reconcile.Granter do
       subject_id,
       target,
       ctx.actor,
-      ctx.domain
+      ctx.domain,
+      tenant: ctx.tenant
     )
   end
 
