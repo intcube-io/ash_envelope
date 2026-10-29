@@ -44,6 +44,10 @@ Each SR is classified by the level at which it is enforced and whether it is ess
 | SR29 | Test: variant gen cleans up temp file on crash | | ✓ | | Yes (when variants in use) |
 | SR30 | Document storage-credential custody (EA11) | | ✓ | | Yes |
 | SR31 | Document proxy-auth integrator responsibility | | ✓ | | Yes (when encryption in use) |
+| SR36 | Reconciliation, `KeyGrants`, `GrantRequests` are tenant-scoped | | ✓ | ✓ | Yes (when multitenancy is in use) |
+| SR37 | Reconciliation failures surfaced and retried; async enqueue inside the triggering transaction | | ✓ | | Yes: a dropped revocation is a silent authorization leak |
+| SR38 | Error tuples, not exceptions, for malformed per-request key material and wraps | | ✓ | | No (availability hardening; T12) |
+| SR39 | Generator scaffolds consistent with runtime contracts (compiling DSL, blob-id subject, actor-threaded handlers) | | ✓ | | Yes: scaffolds are the default integrator configuration |
 
 SR1, SR11, SR12, SR18 retired with the v0.3.0 removal of `:simple` storage mode, `AshEnvelope.Storage.Plug`, and the process-dictionary DEK handoff.
 

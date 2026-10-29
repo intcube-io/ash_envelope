@@ -66,6 +66,126 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
                AshEnvelope.recover_plaintext(blob, ciphertext, backup_priv)
     end
 
+    # Recovery bypasses AshStorage.Layer.Encryption, so it must enforce
+    # the same exact IV/tag lengths itself. AES-GCM happily verifies a
+    # tag of any length up to 16 bytes; a metadata writer who shortens
+    # the stored tag to one byte would otherwise turn a 2^-128 forgery
+    # bound into 2^-8.
+    test "recover_plaintext rejects a truncated tag instead of verifying against it", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, ciphertext} = write_blob(actor, "tag length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      {:ok, <<truncated::binary-1, _::binary>>} = Base.decode64(layer_metadata["tag"])
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          Map.put(layer_metadata, "tag", Base.encode64(truncated))
+        )
+
+      assert {:error, {:invalid_encryption_layer_metadata, "tag"}} =
+               AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+
+      # A forged ciphertext byte can never be accepted via a short tag.
+      <<first, rest::binary>> = ciphertext
+      forged = <<Bitwise.bxor(first, 1), rest::binary>>
+
+      for t <- 0..255 do
+        tampered =
+          replace_layer_metadata(
+            blob,
+            entry,
+            Map.put(layer_metadata, "tag", Base.encode64(<<t>>))
+          )
+
+        assert {:error, {:invalid_encryption_layer_metadata, "tag"}} =
+                 AshEnvelope.recover_plaintext(tampered, forged, backup_priv)
+      end
+    end
+
+    test "recover_plaintext rejects an IV that is not 12 bytes", %{actor: actor} do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, ciphertext} = write_blob(actor, "iv length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      {:ok, iv} = Base.decode64(layer_metadata["iv"])
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          Map.put(layer_metadata, "iv", Base.encode64(iv <> <<0>>))
+        )
+
+      assert {:error, {:invalid_encryption_layer_metadata, "iv"}} =
+               AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+    end
+
+    # A backup wrap that authenticates but does not carry a 32-byte DEK
+    # (anyone holding the backup public key can craft one) must surface
+    # as an error tuple, not as an ErlangError from :crypto.
+    test "recover_plaintext returns an error for a backup wrap holding a short DEK", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, ciphertext} = write_blob(actor, "dek length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      bogus_backup = %{
+        "format" => "x25519-ecies-v1",
+        "key_id" => Backup.key_id(backup_pub),
+        "ciphertext" => Base.encode64(ecies_wrap(backup_pub, "short"))
+      }
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          put_in(layer_metadata, ["wrapped_dek", "backup"], bogus_backup)
+        )
+
+      assert {:error, :malformed_blob} =
+               AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+    end
+
+    # A backup wrap that authenticates but carries a short inner plaintext
+    # (craftable by anyone holding the backup public key) must not come
+    # back from recover_dek/2 as a short "DEK".
+    test "recover_dek rejects a backup wrap whose inner ciphertext is not 32 bytes", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, _ciphertext} = write_blob(actor, "dek length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      bogus_backup = %{
+        "format" => "x25519-ecies-v1",
+        "key_id" => Backup.key_id(backup_pub),
+        "ciphertext" => Base.encode64(ecies_wrap(backup_pub, "short"))
+      }
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          put_in(layer_metadata, ["wrapped_dek", "backup"], bogus_backup)
+        )
+
+      assert {:error, :malformed_blob} = AshEnvelope.recover_dek(tampered, backup_priv)
+    end
+
     test "no backup field when backup_public_key is unset", %{actor: actor} do
       Application.delete_env(:ash_envelope, :backup_public_key)
 
@@ -178,6 +298,101 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
       assert BackupRotation.needs_rotation?(reread) == true
     end
 
+    # The struct handed to rotate/2 usually comes out of a long Ash.stream!
+    # pass and may be stale. Everything rotation writes must derive from
+    # the row as it is *now*: if the row's envelope was replaced (new DEK,
+    # new backup wrap under the previous key) after the snapshot was
+    # taken, re-wrapping the snapshot's DEK would persist a backup of a
+    # key the blob no longer uses — an unrecoverable blob whose key_id
+    # claims it is current.
+    test "re-wraps the DEK from the stored row, not from the streamed snapshot", %{
+      actor: actor
+    } do
+      {old_pub, old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      post =
+        @resource
+        |> Ash.create!(%{title: "Stale snapshot"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "stale", filename: "s.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      snapshot = post.__metadata__[:blob]
+      {:ok, original_dek} = AshEnvelope.recover_dek(snapshot, old_priv)
+
+      # Concurrent writer replaces the row's envelope with a fresh DEK,
+      # still escrowed under the (then current) old backup key.
+      replacement_dek = AshEnvelope.generate_dek()
+
+      [%{"metadata" => layer_metadata} = entry] =
+        snapshot.metadata["ash_storage"]["blob_io"]["layers"]
+
+      replaced_layer_metadata =
+        put_in(
+          layer_metadata,
+          ["wrapped_dek", "backup"],
+          Backup.wrap_for_public_key(replacement_dek, old_pub)
+        )
+
+      replaced_metadata =
+        put_in(snapshot.metadata, ["ash_storage", "blob_io", "layers"], [
+          Map.put(entry, "metadata", replaced_layer_metadata)
+        ])
+
+      {:ok, _} =
+        Ash.update(snapshot, %{metadata: replaced_metadata},
+          action: :update_metadata,
+          domain: @domain
+        )
+
+      {new_pub, new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      # Rotation is driven from the stale snapshot.
+      assert {:ok, rotated} = BackupRotation.rotate(snapshot, previous_private_key: old_priv)
+
+      assert AshEnvelope.recover_dek(rotated, new_priv) == {:ok, replacement_dek}
+      refute AshEnvelope.recover_dek(rotated, new_priv) == {:ok, original_dek}
+    end
+
+    test "a stale snapshot of a row that was already rotated is a no-op", %{actor: actor} do
+      {old_pub, old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      post =
+        @resource
+        |> Ash.create!(%{title: "Already rotated elsewhere"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "twice", filename: "t.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      snapshot = post.__metadata__[:blob]
+
+      {new_pub, new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      # Another run rotates the row first.
+      {:ok, blob} = Ash.get(@blob_resource, snapshot.id, domain: @domain)
+      assert {:ok, _} = BackupRotation.rotate(blob, previous_private_key: old_priv)
+
+      # This run still holds the pre-rotation snapshot and does not even
+      # hold a usable previous key; it must observe the row is current
+      # rather than fail (or re-wrap) based on the snapshot.
+      {_pub, unrelated_priv} = AshEnvelope.generate_key_pair()
+      assert {:ok, fresh} = BackupRotation.rotate(snapshot, previous_private_key: unrelated_priv)
+      assert BackupRotation.needs_rotation?(fresh) == false
+      assert {:ok, _dek} = AshEnvelope.recover_dek(fresh, new_priv)
+    end
+
     test "is idempotent when the blob already uses the current key", %{actor: actor} do
       {pub, _priv} = AshEnvelope.generate_key_pair()
       Application.put_env(:ash_envelope, :backup_public_key, pub)
@@ -220,14 +435,86 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
       {new_pub, _new_priv} = AshEnvelope.generate_key_pair()
       Application.put_env(:ash_envelope, :backup_public_key, new_pub)
 
-      assert {:ok, %{rotated: 0, remaining_stale: 1}} =
+      assert {:ok, %{rotated: 0, remaining_stale: 1, failed: %{}}} =
                BackupRotation.rotate_resource(@blob_resource,
                  domain: @domain,
                  check_only: true
+               )
+    end
+
+    # A blob whose rotation fails is still counted as stale (the CLI's
+    # exit-1 gate), but the operator also needs to know *why* — a wrong
+    # previous key, an authorization failure and a lost row look
+    # identical as a bare "remaining_stale" count.
+    test "reports per-reason failure counts instead of swallowing them", %{actor: actor} do
+      {old_pub, _old_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, old_pub)
+
+      _post =
+        @resource
+        |> Ash.create!(%{title: "fail"}, domain: @domain)
+        |> Ash.update!(
+          %{io: "fail this", filename: "f.txt", content_type: "text/plain"},
+          action: :attach_document,
+          domain: @domain,
+          actor: actor
+        )
+
+      {new_pub, _new_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, new_pub)
+      Application.put_env(:ash_envelope, :backup_public_key_previous, old_pub)
+
+      {_pub, wrong_priv} = AshEnvelope.generate_key_pair()
+
+      assert {:ok, %{rotated: 0, remaining_stale: 1, failed: %{decryption_failed: 1}}} =
+               BackupRotation.rotate_resource(@blob_resource,
+                 domain: @domain,
+                 previous_private_key: wrong_priv
                )
     end
   end
 
   defp restore(key, nil), do: Application.delete_env(:ash_envelope, key)
   defp restore(key, value), do: Application.put_env(:ash_envelope, key, value)
+
+  defp write_blob(actor, content) do
+    post =
+      @resource
+      |> Ash.create!(%{title: "blob"}, domain: @domain)
+      |> Ash.update!(
+        %{io: content, filename: "b.txt", content_type: "text/plain"},
+        action: :attach_document,
+        domain: @domain,
+        actor: actor
+      )
+
+    blob = post.__metadata__[:blob]
+    {:ok, ciphertext} = AshStorage.Service.Test.download(blob.key, [])
+    {blob, ciphertext}
+  end
+
+  defp layers(blob), do: blob.metadata["ash_storage"]["blob_io"]["layers"]
+
+  defp replace_layer_metadata(blob, entry, layer_metadata) do
+    metadata =
+      put_in(blob.metadata, ["ash_storage", "blob_io", "layers"], [
+        Map.put(entry, "metadata", layer_metadata)
+      ])
+
+    %{blob | metadata: metadata}
+  end
+
+  # Same construction as AshEnvelope.wrap_dek/2 but with an arbitrary
+  # inner plaintext, as an attacker holding only the public key could do.
+  defp ecies_wrap(recipient_public_key, inner_plaintext) do
+    {eph_public, eph_private} = :crypto.generate_key(:ecdh, :x25519)
+    shared_secret = :crypto.compute_key(:ecdh, recipient_public_key, eph_private, :x25519)
+    derived_key = AshEnvelope.hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
+    iv = :crypto.strong_rand_bytes(12)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, inner_plaintext, "", true)
+
+    eph_public <> iv <> tag <> ciphertext
+  end
 end

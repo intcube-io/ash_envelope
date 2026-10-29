@@ -148,7 +148,9 @@ defmodule AshEnvelope.Reconcile.Runner do
 
         case load_target(ctx, target_id) do
           {:ok, target} when not is_nil(target) ->
-            GrantRequests.fulfill(config, grants_config, request, actor, target, ctx.domain)
+            GrantRequests.fulfill(config, grants_config, request, actor, target, ctx.domain,
+              tenant: ctx.tenant
+            )
 
           {:ok, nil} ->
             {:error, :target_not_found}
@@ -163,7 +165,11 @@ defmodule AshEnvelope.Reconcile.Runner do
   end
 
   defp load_target(%Context{} = ctx, target_id) do
-    case Ash.get(ctx.user_resource, target_id, domain: ctx.domain, authorize?: false) do
+    case Ash.get(ctx.user_resource, target_id,
+           domain: ctx.domain,
+           tenant: ctx.tenant,
+           authorize?: false
+         ) do
       {:ok, user} ->
         {:ok, user}
 
@@ -287,11 +293,22 @@ defmodule AshEnvelope.Reconcile.Runner do
     with {:ok, principal} when not is_nil(principal) <- load_principal(ctx, principal_id),
          {:ok, subject} when not is_nil(subject) <- load_subject(ctx, subject_input),
          {:ok, grant_subject_id} <- resolve_grant_subject_id(ctx, subject) do
-      should_grant? = Ash.can?({subject, :read}, principal, domain: ctx.domain)
-      has_grant? = grant_exists?(ctx, grant_subject_id, principal_id)
+      # `maybe_is: false`: an unresolvable `:maybe` policy result must not
+      # authorize issuing a decryption grant — fail closed. `run_queries?`
+      # (default `true`) still resolves filter checks against the data
+      # layer first, so this only changes the answer for checks the
+      # authorizer genuinely cannot decide at planning time.
+      should_grant? =
+        Ash.can?({subject, :read}, principal,
+          domain: ctx.domain,
+          tenant: ctx.tenant,
+          maybe_is: false
+        )
+
+      grant_status = grant_status(ctx, grant_subject_id, principal_id)
 
       cond do
-        should_grant? and not has_grant? ->
+        should_grant? and grant_status != :live ->
           %{
             plan
             | grants: [
@@ -305,7 +322,7 @@ defmodule AshEnvelope.Reconcile.Runner do
               ]
           }
 
-        not should_grant? and has_grant? ->
+        not should_grant? and grant_status != :absent ->
           %{
             plan
             | revocations: [
@@ -332,6 +349,7 @@ defmodule AshEnvelope.Reconcile.Runner do
   defp load_principal(ctx, principal_id) do
     Ash.get(ctx.user_resource, principal_id,
       domain: ctx.domain,
+      tenant: ctx.tenant,
       authorize?: false,
       load: ctx.user_load
     )
@@ -341,13 +359,18 @@ defmodule AshEnvelope.Reconcile.Runner do
     if ctx.subject_load == [] do
       {:ok, record}
     else
-      Ash.load(record, ctx.subject_load, domain: ctx.domain, authorize?: false)
+      Ash.load(record, ctx.subject_load,
+        domain: ctx.domain,
+        tenant: ctx.tenant,
+        authorize?: false
+      )
     end
   end
 
   defp load_subject(ctx, subject_id) do
     Ash.get(ctx.encrypted_resource, subject_id,
       domain: ctx.domain,
+      tenant: ctx.tenant,
       authorize?: false,
       load: ctx.subject_load
     )
@@ -365,16 +388,35 @@ defmodule AshEnvelope.Reconcile.Runner do
     end
   end
 
-  defp grant_exists?(ctx, subject_id, principal_id) do
+  defp grant_status(ctx, subject_id, principal_id) do
     config = ctx.key_grants_config
 
+    # System-side bookkeeping read: bypass policies on the grants resource.
+    # Authorization for the pair was already decided by the planner via
+    # `Ash.can?({subject, :read}, principal)` — this read only answers
+    # whether a row exists. Honoring `config.authorize?` here meant every
+    # nil-actor planner read on a policy-protected grants table came back
+    # empty, so stale grants were never planned for revocation.
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id}])
     |> Ash.Query.limit(1)
-    |> Ash.read(domain: ctx.domain, authorize?: config.authorize?)
+    |> Ash.read(domain: ctx.domain, tenant: ctx.tenant, authorize?: false)
     |> case do
-      {:ok, [_ | _]} -> true
+      {:ok, [grant | _]} -> if expired?(grant, config), do: :expired, else: :live
+      _ -> :absent
+    end
+  end
+
+  # An expired row counts as absent for issuance (`KeyGrants.resolve_for_actor/4`
+  # already rejects it, and the documented contract is that reconcile re-issues
+  # it while the read policy still authorizes) but as present for revocation
+  # (an unauthorized principal's stale row should still be cleaned up).
+  defp expired?(_grant, %KeyGrants.Config{expires_at_attribute: nil}), do: false
+
+  defp expired?(grant, %KeyGrants.Config{expires_at_attribute: attr}) do
+    case Map.get(grant, attr) do
+      %DateTime{} = expires_at -> DateTime.compare(expires_at, DateTime.utc_now()) != :gt
       _ -> false
     end
   end
@@ -391,6 +433,8 @@ defmodule AshEnvelope.Reconcile.Runner do
          target: target,
          principal_id: principal_id
        }) do
+    destroy_expired_grants(ctx, subject_id, principal_id)
+
     case Granter.try_chain(ctx, subject, subject_id, target) do
       :ok ->
         []
@@ -411,6 +455,55 @@ defmodule AshEnvelope.Reconcile.Runner do
     end
   end
 
+  # The planner counts expired rows as absent, so a grant about to be issued
+  # would collide with a stale expired row on the grants table's
+  # (subject, principal) unique index. Clear expired rows for the pair first.
+  # Same system-side bypass rationale as `revoke_entry/2`: the planner's
+  # `Ash.can?` already made the security decision.
+  defp destroy_expired_grants(
+         %Context{key_grants_config: %KeyGrants.Config{expires_at_attribute: nil}},
+         _subject_id,
+         _principal_id
+       ) do
+    :ok
+  end
+
+  defp destroy_expired_grants(ctx, subject_id, principal_id) do
+    config = ctx.key_grants_config
+
+    stale_query =
+      config.resource
+      |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
+      |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id}])
+
+    case Ash.read(stale_query, domain: ctx.domain, tenant: ctx.tenant, authorize?: false) do
+      {:ok, grants} ->
+        grants
+        |> Enum.filter(&expired?(&1, config))
+        |> Enum.each(fn grant ->
+          case KeyGrants.revoke(grant, ctx.domain, authorize?: false, tenant: ctx.tenant) do
+            :ok ->
+              :ok
+
+            {:ok, _} ->
+              :ok
+
+            {:error, reason} ->
+              Logger.warning(
+                "[AshEnvelope.Reconcile] expired-grant cleanup failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
+              )
+          end
+        end)
+
+      {:error, reason} ->
+        Logger.warning(
+          "[AshEnvelope.Reconcile] expired-grant cleanup read failed for #{inspect({principal_id, subject_id})}: #{inspect(reason)}"
+        )
+    end
+
+    :ok
+  end
+
   defp revoke_entry(ctx, %{principal_id: principal_id, subject_id: subject_id}) do
     revoke_grants(ctx, principal_id, subject_id) ++
       revoke_pending_requests(ctx, principal_id, subject_id)
@@ -424,13 +517,13 @@ defmodule AshEnvelope.Reconcile.Runner do
       |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
       |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id}])
 
-    case Ash.read(grant_query, domain: ctx.domain, authorize?: false) do
+    case Ash.read(grant_query, domain: ctx.domain, tenant: ctx.tenant, authorize?: false) do
       {:ok, grants} ->
         Enum.flat_map(grants, fn grant ->
           # System-side revocation: bypass policies on the grants resource.
           # Authorization for *whether* to revoke was already decided by the
           # planner via `Ash.can?({subject, :read}, principal)`.
-          case KeyGrants.revoke(grant, ctx.domain, authorize?: false) do
+          case KeyGrants.revoke(grant, ctx.domain, authorize?: false, tenant: ctx.tenant) do
             :ok ->
               []
 
@@ -459,11 +552,16 @@ defmodule AshEnvelope.Reconcile.Runner do
     do: []
 
   defp revoke_pending_requests(ctx, principal_id, subject_id) do
+    # Same system-side bypass as the grant revoke above: the planner's
+    # `Ash.can?` already decided the target lost access, and a nil-actor
+    # policy read on the requests table would silently match nothing.
     case GrantRequests.revoke_pending_for(
            ctx.grant_requests_config,
            subject_id,
            principal_id,
-           ctx.domain
+           ctx.domain,
+           authorize?: false,
+           tenant: ctx.tenant
          ) do
       {:ok, _} ->
         []
