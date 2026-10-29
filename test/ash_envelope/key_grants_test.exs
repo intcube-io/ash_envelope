@@ -220,6 +220,63 @@ defmodule AshEnvelope.KeyGrantsTest do
       assert {:error, :decryption_failed} =
                KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, ctx.actor, @domain)
     end
+
+    test "returns {:error, {:missing_actor_key, _}} when a grant exists but the actor has no private key",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      public_only = Map.delete(ctx.actor, :private_key)
+
+      assert {:error, {:missing_actor_key, :private_key}} =
+               KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, public_only, @domain)
+    end
+
+    test "a public-key-only actor with no grant still gets :not_found", ctx do
+      public_only = Map.delete(ctx.actor, :private_key)
+
+      assert {:error, :not_found} =
+               KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, public_only, @domain)
+    end
+  end
+
+  describe "actor key errors are error tuples, not exceptions" do
+    test "create_for_actor returns {:error, {:missing_actor_key, _}} for an actor without a public key",
+         ctx do
+      keyless = %{id: Ash.UUID.generate()}
+
+      assert {:error, {:missing_actor_key, :public_key}} =
+               KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, keyless, @domain)
+
+      assert {:ok, []} =
+               AshEnvelope.Test.Grant
+               |> Ash.Query.filter(subject_id == ^ctx.subject_id)
+               |> Ash.read(domain: @domain, authorize?: false)
+    end
+
+    test "create_for_actor returns {:error, {:invalid_actor_key, _}} for a malformed public key",
+         ctx do
+      malformed = %{id: Ash.UUID.generate(), public_key: Base.encode64(<<1, 2, 3>>)}
+
+      assert {:error, {:invalid_actor_key, :public_key}} =
+               KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, malformed, @domain)
+    end
+
+    test "share returns an error tuple and creates nothing when the target has no public key",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      keyless = %{id: Ash.UUID.generate()}
+
+      assert {:error, {:missing_actor_key, :public_key}} =
+               KeyGrants.share(ctx.config, ctx.subject_id, ctx.actor, keyless, @domain)
+
+      assert {:ok, []} =
+               AshEnvelope.Test.Grant
+               |> Ash.Query.filter(subject_id == ^ctx.subject_id and user_id == ^keyless.id)
+               |> Ash.read(domain: @domain, authorize?: false)
+    end
   end
 
   describe "revoke/2" do

@@ -308,6 +308,29 @@ defmodule AshEnvelopeTest do
     end
   end
 
+  describe "fetch_actor_key/2" do
+    test "returns {:ok, key} for raw and base64 keys" do
+      raw_key = :crypto.strong_rand_bytes(32)
+
+      assert {:ok, ^raw_key} = AshEnvelope.fetch_actor_key(%{key: raw_key}, :key)
+      assert {:ok, ^raw_key} = AshEnvelope.fetch_actor_key(%{key: Base.encode64(raw_key)}, :key)
+    end
+
+    test "returns {:error, {:missing_actor_key, attr}} for nil actor or nil attribute" do
+      assert {:error, {:missing_actor_key, :key}} = AshEnvelope.fetch_actor_key(nil, :key)
+      assert {:error, {:missing_actor_key, :key}} = AshEnvelope.fetch_actor_key(%{id: 1}, :key)
+    end
+
+    test "returns {:error, {:invalid_actor_key, attr}} without echoing the value" do
+      short = :crypto.strong_rand_bytes(16)
+
+      assert {:error, {:invalid_actor_key, :key}} =
+               AshEnvelope.fetch_actor_key(%{key: Base.encode64(short)}, :key)
+
+      assert {:error, {:invalid_actor_key, :key}} = AshEnvelope.fetch_actor_key(%{key: 42}, :key)
+    end
+  end
+
   # SR4: the HKDF helper is documented as capping output at 32 bytes (one
   # SHA-256 block) so that callers cannot silently truncate the derived
   # key. Verify the guard so a refactor cannot accidentally lift the cap.
