@@ -83,8 +83,18 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
     @format "ash_envelope_key_grants_v1"
 
     @impl true
-    def wrap_dek(dek, %Writer.Operation{}, _opts) when is_binary(dek) do
-      {:ok, %{"format" => @format} |> Backup.put_backup(Backup.wrap_for_backup(dek)), %{dek: dek}}
+    def wrap_dek(dek, %Writer.Operation{}, opts) when is_binary(dek) do
+      # `wrap_dek/3` runs before the service upload and before the blob
+      # row exists; `finalize_wrapped_dek/3` runs after both. Every option
+      # finalize needs is validated here so a misconfigured manager fails
+      # the write up front instead of leaving an uploaded ciphertext and a
+      # blob row with no grant behind it.
+      with {:ok, _config} <- config_from(opts),
+           {:ok, _domain} <- fetch_option(opts, :domain),
+           :ok <- validate_subject_id_resolver(opts) do
+        {:ok, %{"format" => @format} |> Backup.put_backup(Backup.wrap_for_backup(dek)),
+         %{dek: dek}}
+      end
     end
 
     @impl true
@@ -156,6 +166,14 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
       case Keyword.get(opts, :subject_id_resolver) do
         nil -> {:ok, bctx.blob.id}
         resolver when is_function(resolver, 1) -> {:ok, resolver.(bctx)}
+        other -> {:error, {:invalid_key_grants_subject_id_resolver, other}}
+      end
+    end
+
+    defp validate_subject_id_resolver(opts) do
+      case Keyword.get(opts, :subject_id_resolver) do
+        nil -> :ok
+        resolver when is_function(resolver, 1) -> :ok
         other -> {:error, {:invalid_key_grants_subject_id_resolver, other}}
       end
     end
