@@ -10,6 +10,20 @@ defmodule AshEnvelopeTest do
     <<prefix::binary, bxor(byte, 1), rest::binary>>
   end
 
+  # Same construction as AshEnvelope.wrap_dek/2 but with an arbitrary
+  # inner plaintext, as an attacker holding only the public key could do.
+  defp ecies_wrap(recipient_public_key, inner_plaintext) do
+    {eph_public, eph_private} = :crypto.generate_key(:ecdh, :x25519)
+    shared_secret = :crypto.compute_key(:ecdh, recipient_public_key, eph_private, :x25519)
+    derived_key = AshEnvelope.hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
+    iv = :crypto.strong_rand_bytes(12)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, inner_plaintext, "", true)
+
+    eph_public <> iv <> tag <> ciphertext
+  end
+
   describe "encrypt/3 and decrypt/3" do
     test "round-trips arbitrary data with no AAD" do
       key = AshEnvelope.generate_dek()
@@ -209,6 +223,25 @@ defmodule AshEnvelopeTest do
     test "too-short blob returns :malformed_blob" do
       {_pub, priv} = AshEnvelope.generate_key_pair()
       assert AshEnvelope.unwrap_dek(<<0::size(59 * 8)>>, priv) == {:error, :malformed_blob}
+    end
+
+    # Anyone holding the recipient's PUBLIC key can produce a blob that
+    # authenticates but whose inner plaintext is not a 32-byte DEK (same
+    # construction as wrap_dek/2 with a different inner plaintext). The
+    # layout check must reject it so no caller ever receives a short
+    # "DEK" and feeds it to AES-256-GCM (which raises on a bad key size).
+    test "inner ciphertext that is not 32 bytes returns :malformed_blob" do
+      {pub, priv} = AshEnvelope.generate_key_pair()
+
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, ""), priv) == {:error, :malformed_blob}
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, "short"), priv) == {:error, :malformed_blob}
+
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, :crypto.strong_rand_bytes(33)), priv) ==
+               {:error, :malformed_blob}
+
+      # Sanity: the same construction with a 32-byte inner plaintext still unwraps.
+      dek = AshEnvelope.generate_dek()
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, dek), priv) == {:ok, dek}
     end
 
     # Regression: an all-zero ephemeral public key is a degenerate

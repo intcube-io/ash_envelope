@@ -154,8 +154,36 @@ defmodule AshEnvelope.BlobIO.BackupIntegrationTest do
           put_in(layer_metadata, ["wrapped_dek", "backup"], bogus_backup)
         )
 
-      assert {:error, :decryption_failed} =
+      assert {:error, :malformed_blob} =
                AshEnvelope.recover_plaintext(tampered, ciphertext, backup_priv)
+    end
+
+    # A backup wrap that authenticates but carries a short inner plaintext
+    # (craftable by anyone holding the backup public key) must not come
+    # back from recover_dek/2 as a short "DEK".
+    test "recover_dek rejects a backup wrap whose inner ciphertext is not 32 bytes", %{
+      actor: actor
+    } do
+      {backup_pub, backup_priv} = AshEnvelope.generate_key_pair()
+      Application.put_env(:ash_envelope, :backup_public_key, backup_pub)
+
+      {blob, _ciphertext} = write_blob(actor, "dek length matters")
+      [%{"metadata" => layer_metadata} = entry] = layers(blob)
+
+      bogus_backup = %{
+        "format" => "x25519-ecies-v1",
+        "key_id" => Backup.key_id(backup_pub),
+        "ciphertext" => Base.encode64(ecies_wrap(backup_pub, "short"))
+      }
+
+      tampered =
+        replace_layer_metadata(
+          blob,
+          entry,
+          put_in(layer_metadata, ["wrapped_dek", "backup"], bogus_backup)
+        )
+
+      assert {:error, :malformed_blob} = AshEnvelope.recover_dek(tampered, backup_priv)
     end
 
     test "no backup field when backup_public_key is unset", %{actor: actor} do

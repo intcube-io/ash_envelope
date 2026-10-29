@@ -203,7 +203,9 @@ defmodule AshEnvelope do
   X25519 private key.
 
   Returns `{:ok, raw_dek}` (32-byte binary), `{:error, :malformed_blob}`
-  if the blob doesn't match the expected layout, or
+  if the blob doesn't match the expected layout (including an inner
+  ciphertext that is not exactly 32 bytes, so a successful unwrap can
+  never yield anything but a 32-byte DEK), or
   `{:error, :decryption_failed}` if authentication fails or the embedded
   ephemeral public key is a degenerate/low-order X25519 point (a blob
   carrying such a point is indistinguishable from a tampered one).
@@ -211,7 +213,7 @@ defmodule AshEnvelope do
   @spec unwrap_dek(binary(), binary()) ::
           {:ok, binary()} | {:error, :malformed_blob | :decryption_failed}
   def unwrap_dek(
-        <<eph_public::binary-32, iv::binary-12, tag::binary-16, ciphertext::binary>>,
+        <<eph_public::binary-32, iv::binary-12, tag::binary-16, ciphertext::binary-32>>,
         recipient_private_key
       )
       when byte_size(recipient_private_key) == 32 do
