@@ -296,6 +296,48 @@ defmodule AshEnvelope.GrantRequestsTest do
     end
   end
 
+  describe "fulfill/7 target verification" do
+    test "returns {:error, :target_mismatch} when target_actor is not the request's target",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.grants_config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      :ok =
+        GrantRequests.create(
+          ctx.requests_config,
+          ctx.subject_id,
+          ctx.target,
+          ctx.requester,
+          @domain
+        )
+
+      {:ok, [request]} =
+        GrantRequests.list_pending_for_subject(ctx.requests_config, ctx.subject_id, @domain)
+
+      {pub, priv} = AshEnvelope.generate_key_pair()
+      imposter = %{id: Ash.UUID.generate(), public_key: pub, private_key: priv}
+
+      assert {:error, :target_mismatch} =
+               GrantRequests.fulfill(
+                 ctx.requests_config,
+                 ctx.grants_config,
+                 request,
+                 ctx.actor,
+                 imposter,
+                 @domain
+               )
+
+      # No DEK leaked to the imposter and the request stays pending.
+      assert {:error, :not_found} =
+               KeyGrants.resolve_for_actor(ctx.grants_config, ctx.subject_id, imposter, @domain)
+
+      {:ok, [pending]} =
+        GrantRequests.list_pending_for_subject(ctx.requests_config, ctx.subject_id, @domain)
+
+      assert pending.id == request.id
+    end
+  end
+
   describe "fulfill_outstanding/5" do
     test "fulfills every request the actor can fulfill, returns counts", ctx do
       # Two subjects the actor holds a grant on, plus one pending request on each.
@@ -346,6 +388,55 @@ defmodule AshEnvelope.GrantRequestsTest do
 
       {:ok, ^dek_b} =
         KeyGrants.resolve_for_actor(ctx.grants_config, subject_b, ctx.target, @domain)
+    end
+
+    test "does not raise when a pending target already holds a grant and is loaded public-only",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.grants_config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      # Target already holds a grant (shared earlier with full keys) …
+      :ok = KeyGrants.share(ctx.grants_config, ctx.subject_id, ctx.actor, ctx.target, @domain)
+
+      # … but a pending request for them still exists.
+      :ok =
+        GrantRequests.create(
+          ctx.requests_config,
+          ctx.subject_id,
+          ctx.target,
+          ctx.requester,
+          @domain
+        )
+
+      # Login-hook loading contract: only the target's public key.
+      public_only = %{id: ctx.target.id, public_key: ctx.target.public_key}
+      target_loader = fn _id -> {:ok, public_only} end
+
+      # Previously raised ArgumentError from unwrapping with the target's
+      # (absent) private key on every login.
+      assert {1, 0} =
+               GrantRequests.fulfill_outstanding(
+                 ctx.requests_config,
+                 ctx.grants_config,
+                 ctx.actor,
+                 @domain,
+                 target_loader
+               )
+
+      {:ok, pending} =
+        GrantRequests.list_pending_for_subject(ctx.requests_config, ctx.subject_id, @domain)
+
+      assert pending == []
+
+      subject = ctx.subject_id
+      target_id = ctx.target.id
+
+      {:ok, grants} =
+        AshEnvelope.Test.Grant
+        |> Ash.Query.filter(subject_id == ^subject and user_id == ^target_id)
+        |> Ash.read(domain: @domain, authorize?: false)
+
+      assert length(grants) == 1
     end
 
     test "counts target-load failures as errors", ctx do
@@ -436,6 +527,31 @@ defmodule AshEnvelope.GrantRequestsTest do
                domain: @domain,
                authorize?: false
              )
+    end
+
+    test "halts on the first destroy failure and returns the error tuple", ctx do
+      # Seed straight into the data layer: the partial unique identity
+      # normally caps pending rows at one per (subject, target), but an
+      # integrator's resource may not carry it — the reducer must not
+      # rely on that. Both rows are unrevokable so the failure is
+      # guaranteed to occur mid-stream regardless of read order
+      # (previously the second iteration raised FunctionClauseError).
+      for _ <- 1..2 do
+        Ash.Seed.seed!(AshEnvelope.Test.GrantRequest, %{
+          subject_id: ctx.subject_id,
+          user_id: ctx.target.id,
+          requested_at: DateTime.utc_now(),
+          reason: "unrevokable"
+        })
+      end
+
+      assert {:error, _} =
+               GrantRequests.revoke_pending_for(
+                 ctx.requests_config,
+                 ctx.subject_id,
+                 ctx.target.id,
+                 @domain
+               )
     end
   end
 end

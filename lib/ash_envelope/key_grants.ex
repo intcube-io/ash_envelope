@@ -53,6 +53,28 @@ defmodule AshEnvelope.KeyGrants do
 
   Requires `:expires_at_attribute` on the `Config` and a configured
   `AshEnvelope.SealKey`.
+
+  ## Authorization actors
+
+  Every call that goes through Ash with `authorize?: true` (the
+  `Config` default) threads an actor so the resource's policies are
+  evaluated against a real principal, never `nil`:
+
+  * `create_for_actor/6` / `resolve_for_actor/5` — policies see the
+    grantee `actor` argument.
+  * `share/6` — the granting-side resolve and the grant create run
+    with the **calling** (granting) actor; the target-side existence
+    check runs with the **target** actor (it reads the target's own
+    rows, matching read policies shaped like `user_id == ^actor(:id)`).
+  * `revoke/3` — policies see `opts[:actor]` (defaults to `nil`).
+  * Ephemeral calls (`create_ephemeral/5`, `resolve_ephemeral/4`,
+    `renew_ephemeral/5`) have no natural principal; policies see
+    `opts[:actor]` (defaults to `nil`). These are typically system-side
+    paths run with `authorize?: false` via the `Config`.
+    `renew_ephemeral_with_actor/5` forwards its `actor` argument.
+
+  Every one of these accepts an `opts[:actor]` override when a
+  distinct authorization actor is required.
   """
 
   alias AshEnvelope.KeyGrants.Config
@@ -66,6 +88,11 @@ defmodule AshEnvelope.KeyGrants do
 
   `opts[:expires_at]` accepts a `DateTime` to make the grant
   time-bounded; requires `Config.expires_at_attribute` to be set.
+
+  **Authorization:** the create runs with `actor` as the Ash actor, so
+  policies see the grantee. Pass `opts[:actor]` when a different
+  principal should be authorized (e.g. `share/6` creating a grant for
+  the target on behalf of the granting caller).
 
   Returns `:ok` on success or `{:error, reason}` on failure.
   """
@@ -88,7 +115,14 @@ defmodule AshEnvelope.KeyGrants do
 
         attrs = maybe_put_expires_at(attrs, config, Keyword.get(opts, :expires_at))
 
-        case Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?) do
+        create_result =
+          Ash.create(config.resource, attrs,
+            domain: domain,
+            actor: Keyword.get(opts, :actor, actor),
+            authorize?: config.authorize?
+          )
+
+        case create_result do
           {:ok, _} -> :ok
           {:error, _} = err -> err
         end
@@ -102,13 +136,17 @@ defmodule AshEnvelope.KeyGrants do
   past their deadline are treated as if they don't exist
   (`{:error, :not_found}`).
 
+  **Authorization:** the read runs with `actor` as the Ash actor
+  (override via `opts[:actor]`), so actor-scoped read policies
+  (`user_id == ^actor(:id)`) see the resolving principal.
+
   Returns `{:ok, raw_dek}` (32-byte binary) or `{:error, :not_found}`.
   """
-  @spec resolve_for_actor(Config.t(), term(), term(), module()) ::
+  @spec resolve_for_actor(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, binary()}
           | {:error,
              :not_found | :corrupted_dek | :decryption_failed | :missing_principal | term()}
-  def resolve_for_actor(%Config{} = config, subject_id, actor, domain) do
+  def resolve_for_actor(%Config{} = config, subject_id, actor, domain, opts \\ []) do
     case principal_id(actor) do
       nil ->
         {:error, :missing_principal}
@@ -120,7 +158,13 @@ defmodule AshEnvelope.KeyGrants do
           |> Ash.Query.filter(^[{config.principal_id_attribute, pid}])
           |> Ash.Query.select(select_user_grant(config))
 
-        with {:ok, [grant | _]} <- Ash.read(query, domain: domain, authorize?: config.authorize?),
+        read_opts = [
+          domain: domain,
+          actor: Keyword.get(opts, :actor, actor),
+          authorize?: config.authorize?
+        ]
+
+        with {:ok, [grant | _]} <- Ash.read(query, read_opts),
              :ok <- check_not_expired(grant, config),
              {:ok, decoded} <- Base.decode64(Map.get(grant, config.dek_attribute)) do
           AshEnvelope.unwrap_dek(
@@ -140,29 +184,70 @@ defmodule AshEnvelope.KeyGrants do
   Share a DEK with `target_actor`.
 
   Resolves the granting actor's DEK (needs their private key), then
-  re-wraps it for the target (only needs their public key). If
-  `target_actor` already has a grant for this subject, returns `:ok`
-  without creating a duplicate.
+  re-wraps it for the target (only needs their public key — the
+  target's private key is never touched, so a target loaded with only
+  their public key is fine). If `target_actor` already has a live
+  grant for this subject, returns `:ok` without creating a duplicate;
+  the idempotency check is a plain existence read, and a create that
+  loses a concurrent race against the grants unique identity is
+  recovered as `:ok` after re-checking.
+
+  With `Config.expires_at_attribute` set, an expired-but-unpurged row
+  for the target does not block re-sharing: it is purged system-side
+  (`authorize?: false`, mirroring the TTL purge job — the row is
+  already invisible to every resolve path) before the fresh grant is
+  created.
 
   `opts[:expires_at]` is forwarded to `create_for_actor/6` if the
   target needs a fresh grant.
+
+  **Authorization:** the granting-side resolve and the grant create
+  run with the calling `actor` (override the create's actor via
+  `opts[:actor]`); the target-side existence check runs with
+  `target_actor`, whose own rows it reads.
 
   Returns `:ok` or `{:error, reason}`.
   """
   @spec share(Config.t(), term(), term(), term(), module(), keyword()) ::
           :ok | {:error, term()}
   def share(%Config{} = config, subject_id, actor, target_actor, domain, opts \\ []) do
-    with {:ok, raw_dek} <- resolve_for_actor(config, subject_id, actor, domain) do
-      case resolve_for_actor(config, subject_id, target_actor, domain) do
-        {:ok, _} ->
-          :ok
+    case principal_id(target_actor) do
+      nil ->
+        {:error, :missing_principal}
 
-        {:error, :not_found} ->
-          create_for_actor(config, subject_id, raw_dek, target_actor, domain, opts)
+      target_id ->
+        with {:ok, raw_dek} <- resolve_for_actor(config, subject_id, actor, domain) do
+          do_share(config, subject_id, raw_dek, actor, target_actor, target_id, domain, opts)
+        end
+    end
+  end
 
-        {:error, _} = err ->
-          err
-      end
+  defp do_share(config, subject_id, raw_dek, actor, target_actor, target_id, domain, opts) do
+    create_opts = Keyword.put_new(opts, :actor, actor)
+
+    case target_grant_active?(config, subject_id, target_actor, domain) do
+      {:ok, true} ->
+        :ok
+
+      {:ok, false} ->
+        with :ok <- purge_expired_grants_for(config, subject_id, target_id, domain) do
+          case create_for_actor(config, subject_id, raw_dek, target_actor, domain, create_opts) do
+            :ok ->
+              :ok
+
+            {:error, _} = err ->
+              # A concurrent share may have won the race against the
+              # grants unique identity. Re-check before reporting the
+              # failure so duplicate-key conflicts surface as :ok.
+              case target_grant_active?(config, subject_id, target_actor, domain) do
+                {:ok, true} -> :ok
+                _ -> err
+              end
+          end
+        end
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -204,6 +289,9 @@ defmodule AshEnvelope.KeyGrants do
   `opts[:expires_at]` overrides the default TTL
   (`config.ephemeral_ttl_seconds` from now).
 
+  **Authorization:** there is no natural principal on this system-side
+  path; policies see `opts[:actor]` (defaults to `nil`).
+
   Raises `ArgumentError` if the config doesn't have
   `:expires_at_attribute` set.
   """
@@ -214,21 +302,29 @@ defmodule AshEnvelope.KeyGrants do
     require_ephemeral!(config)
 
     with {:ok, sealed} <- SealKey.seal(raw_dek, context: to_string(subject_id)) do
-      expires_at =
-        Keyword.get(
-          opts,
-          :expires_at,
-          DateTime.add(DateTime.utc_now(), config.ephemeral_ttl_seconds, :second)
-        )
-
-      attrs = %{
-        config.subject_id_attribute => subject_id,
-        config.dek_attribute => Base.encode64(sealed),
-        config.expires_at_attribute => expires_at
-      }
-
-      Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?)
+      insert_ephemeral(config, subject_id, sealed, domain, opts)
     end
+  end
+
+  defp insert_ephemeral(%Config{} = config, subject_id, sealed, domain, opts) do
+    expires_at =
+      Keyword.get(
+        opts,
+        :expires_at,
+        DateTime.add(DateTime.utc_now(), config.ephemeral_ttl_seconds, :second)
+      )
+
+    attrs = %{
+      config.subject_id_attribute => subject_id,
+      config.dek_attribute => Base.encode64(sealed),
+      config.expires_at_attribute => expires_at
+    }
+
+    Ash.create(config.resource, attrs,
+      domain: domain,
+      actor: Keyword.get(opts, :actor),
+      authorize?: config.authorize?
+    )
   end
 
   @doc """
@@ -243,11 +339,14 @@ defmodule AshEnvelope.KeyGrants do
     (wrong seal key, AAD mismatch, tampered bytes)
   * `{:error, :corrupted_dek}` — stored sealed value isn't valid
     base64
+
+  **Authorization:** there is no natural principal on this system-side
+  path; policies see `opts[:actor]` (defaults to `nil`).
   """
-  @spec resolve_ephemeral(Config.t(), term(), module()) ::
+  @spec resolve_ephemeral(Config.t(), term(), module(), keyword()) ::
           {:ok, binary()}
           | {:error, :not_found | :expired | :corrupted_dek | :decryption_failed | term()}
-  def resolve_ephemeral(%Config{} = config, subject_id, domain) do
+  def resolve_ephemeral(%Config{} = config, subject_id, domain, opts \\ []) do
     require_ephemeral!(config)
 
     principal_ref = ref(config.principal_id_attribute)
@@ -258,7 +357,13 @@ defmodule AshEnvelope.KeyGrants do
       |> Ash.Query.filter(is_nil(^principal_ref))
       |> Ash.Query.limit(1)
 
-    with {:ok, [row | _]} <- Ash.read(query, domain: domain, authorize?: config.authorize?),
+    read_opts = [
+      domain: domain,
+      actor: Keyword.get(opts, :actor),
+      authorize?: config.authorize?
+    ]
+
+    with {:ok, [row | _]} <- Ash.read(query, read_opts),
          :ok <- check_not_expired(row, config),
          {:ok, sealed} <- decode_base64(Map.get(row, config.dek_attribute)) do
       SealKey.unseal(sealed, context: to_string(subject_id))
@@ -286,6 +391,16 @@ defmodule AshEnvelope.KeyGrants do
 
   Idempotent against missing rows: if no row exists for `subject_id`,
   `renew_ephemeral/5` simply creates one.
+
+  The replacement DEK is sealed *before* the existing row is touched,
+  so a seal failure (missing/invalid seal key) leaves the current
+  ephemeral row intact. The scaffolded one-ephemeral-per-subject
+  unique index rules out insert-before-destroy, so if the insert of
+  the replacement fails after the destroy, the previous row is
+  restored best-effort and the insert error is returned.
+
+  **Authorization:** there is no natural principal on this system-side
+  path; policies see `opts[:actor]` (defaults to `nil`).
   """
   @spec renew_ephemeral(Config.t(), term(), binary(), module(), keyword()) ::
           {:ok, Ash.Resource.record()} | {:error, term()}
@@ -293,8 +408,17 @@ defmodule AshEnvelope.KeyGrants do
       when byte_size(raw_dek) == 32 do
     require_ephemeral!(config)
 
-    with :ok <- destroy_ephemeral_for_subject(config, subject_id, domain) do
-      create_ephemeral(config, subject_id, raw_dek, domain, opts)
+    with {:ok, sealed} <- SealKey.seal(raw_dek, context: to_string(subject_id)),
+         {:ok, previous} <- fetch_ephemeral_row(config, subject_id, domain, opts),
+         :ok <- destroy_ephemeral_for_subject(config, subject_id, domain, opts) do
+      case insert_ephemeral(config, subject_id, sealed, domain, opts) do
+        {:ok, _} = ok ->
+          ok
+
+        {:error, _} = err ->
+          restore_ephemeral_row(config, previous, domain, opts)
+          err
+      end
     end
   end
 
@@ -311,12 +435,16 @@ defmodule AshEnvelope.KeyGrants do
   Use `renew_ephemeral/5` directly only when the DEK is obtained
   through a non-user-grant path (e.g. backup-key recovery via
   `AshEnvelope.recover_dek/2`).
+
+  **Authorization:** policies see `actor` for the grant resolve and
+  for the ephemeral destroy/create (override the latter via
+  `opts[:actor]`).
   """
   @spec renew_ephemeral_with_actor(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, Ash.Resource.record()} | {:error, term()}
   def renew_ephemeral_with_actor(%Config{} = config, subject_id, actor, domain, opts \\ []) do
     with {:ok, dek} <- resolve_for_actor(config, subject_id, actor, domain) do
-      renew_ephemeral(config, subject_id, dek, domain, opts)
+      renew_ephemeral(config, subject_id, dek, domain, Keyword.put_new(opts, :actor, actor))
     end
   end
 
@@ -369,7 +497,105 @@ defmodule AshEnvelope.KeyGrants do
 
   defp decode_base64(_), do: {:error, :corrupted_dek}
 
-  defp destroy_ephemeral_for_subject(%Config{} = config, subject_id, domain) do
+  # Expiry-aware existence read for the target's grant on a subject.
+  # Runs with the target as the Ash actor (it reads the target's own
+  # rows) and never needs the target's private key, so it stays safe
+  # for targets loaded with only their public key.
+  defp target_grant_active?(%Config{} = config, subject_id, target_actor, domain) do
+    query =
+      config.resource
+      |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
+      |> Ash.Query.filter(^[{config.principal_id_attribute, principal_id(target_actor)}])
+      |> Ash.Query.select(select_grant_existence(config))
+
+    case Ash.read(query, domain: domain, actor: target_actor, authorize?: config.authorize?) do
+      {:ok, rows} -> {:ok, Enum.any?(rows, &(check_not_expired(&1, config) == :ok))}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp select_grant_existence(%Config{expires_at_attribute: nil} = config) do
+    [config.subject_id_attribute]
+  end
+
+  defp select_grant_existence(%Config{} = config) do
+    [config.expires_at_attribute]
+  end
+
+  # Expired rows are semantically nonexistent — every resolve path
+  # already treats them as :not_found and scaffolded read policies
+  # filter them out. Purging them here mirrors the system-side TTL
+  # purge job (hence authorize?: false) and keeps re-sharing from
+  # colliding with the scaffolded (subject, user_id) unique index.
+  defp purge_expired_grants_for(%Config{expires_at_attribute: nil}, _subject_id, _pid, _domain) do
+    :ok
+  end
+
+  defp purge_expired_grants_for(%Config{} = config, subject_id, target_id, domain) do
+    expires_ref = ref(config.expires_at_attribute)
+
+    config.resource
+    |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
+    |> Ash.Query.filter(^[{config.principal_id_attribute, target_id}])
+    |> Ash.Query.filter(not is_nil(^expires_ref) and ^expires_ref <= ^DateTime.utc_now())
+    |> Ash.bulk_destroy(
+      :destroy,
+      %{},
+      domain: domain,
+      authorize?: false,
+      return_errors?: true,
+      strategy: [:atomic, :stream]
+    )
+    |> case do
+      %Ash.BulkResult{status: :success} -> :ok
+      %Ash.BulkResult{status: :error, errors: errors} -> {:error, errors}
+    end
+  end
+
+  defp fetch_ephemeral_row(%Config{} = config, subject_id, domain, opts) do
+    principal_ref = ref(config.principal_id_attribute)
+
+    query =
+      config.resource
+      |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
+      |> Ash.Query.filter(is_nil(^principal_ref))
+      |> Ash.Query.limit(1)
+
+    read_opts = [
+      domain: domain,
+      actor: Keyword.get(opts, :actor),
+      authorize?: config.authorize?
+    ]
+
+    case Ash.read(query, read_opts) do
+      {:ok, [row | _]} -> {:ok, row}
+      {:ok, []} -> {:ok, nil}
+      {:error, _} = err -> err
+    end
+  end
+
+  # Best-effort undo when the replacement insert fails after the old
+  # ephemeral row was destroyed: put the previous sealed value and
+  # expiry back so renewal never degrades into pure revocation.
+  defp restore_ephemeral_row(_config, nil, _domain, _opts), do: :ok
+
+  defp restore_ephemeral_row(%Config{} = config, previous, domain, opts) do
+    attrs = %{
+      config.subject_id_attribute => Map.get(previous, config.subject_id_attribute),
+      config.dek_attribute => Map.get(previous, config.dek_attribute),
+      config.expires_at_attribute => Map.get(previous, config.expires_at_attribute)
+    }
+
+    Ash.create(config.resource, attrs,
+      domain: domain,
+      actor: Keyword.get(opts, :actor),
+      authorize?: config.authorize?
+    )
+
+    :ok
+  end
+
+  defp destroy_ephemeral_for_subject(%Config{} = config, subject_id, domain, opts) do
     principal_ref = ref(config.principal_id_attribute)
 
     config.resource
@@ -379,6 +605,7 @@ defmodule AshEnvelope.KeyGrants do
       :destroy,
       %{},
       domain: domain,
+      actor: Keyword.get(opts, :actor),
       authorize?: config.authorize?,
       return_errors?: true,
       strategy: [:atomic, :stream]

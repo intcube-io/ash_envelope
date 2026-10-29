@@ -21,10 +21,31 @@ defmodule AshEnvelope.GrantRequests do
   3. Once fulfilled, the request row is marked with `fulfilled_at` and
      `fulfilled_by` and is no longer surfaced as pending.
 
-  Concurrent fulfillment is safe: `fulfill/5` only flips a row whose
-  `fulfilled_at` is still `nil`, so two simultaneous fulfillers will at
-  worst race on the underlying grant create (which is itself idempotent
-  via the `KeyGrants` unique identity).
+  Concurrent fulfillment is convergent: `fulfill/7` re-reads the row and
+  skips it once `fulfilled_at` is set (a get-then-update, not an atomic
+  conditional), and the underlying `KeyGrants.share/6` recovers a create
+  that loses a race against the grants unique identity as `:ok`. Two
+  simultaneous fulfillers may both report `:ok`, but the target ends up
+  with exactly one grant and the request is marked fulfilled once.
+
+  ## Authorization actors
+
+  Every call that goes through Ash with `authorize?: true` (the
+  `Config` default) threads an actor so policies are evaluated against
+  a real principal:
+
+  * `create/6` — policies see `requested_by_actor` (may be `nil` when
+    no actor triggered the request; pass `opts[:actor]` to authorize as
+    someone else, e.g. a system principal).
+  * `list_pending_for_subject/4` — policies see `opts[:actor]`
+    (defaults to `nil`).
+  * `list_fulfillable_for/5`, `fulfill/7`, `fulfill_outstanding/5` —
+    policies see the fulfilling `actor` argument.
+  * `revoke_pending_for/5` — policies see `opts[:actor]` (defaults to
+    `nil`; this is usually a system path run with `authorize?: false`
+    via the `Config`).
+
+  Where an `opts[:actor]` override exists it takes precedence.
 
   ## Usage
 
@@ -74,6 +95,9 @@ defmodule AshEnvelope.GrantRequests do
 
   `requested_by_actor` may be `nil`.
 
+  **Authorization:** policies see `requested_by_actor` (override via
+  `opts[:actor]`).
+
   Returns `:ok` on success, `{:error, reason}` otherwise.
   """
   @spec create(Config.t(), term(), term(), term() | nil, module(), keyword()) ::
@@ -89,7 +113,9 @@ defmodule AshEnvelope.GrantRequests do
   end
 
   defp do_create(config, subject_id, target_id, requested_by_actor, domain, opts) do
-    case lookup_pending(config, subject_id, target_id, domain) do
+    authz_actor = Keyword.get(opts, :actor, requested_by_actor)
+
+    case lookup_pending(config, subject_id, target_id, domain, authz_actor) do
       {:ok, %_{}} ->
         :ok
 
@@ -107,7 +133,14 @@ defmodule AshEnvelope.GrantRequests do
             reason -> Map.put(attrs, config.reason_attribute, reason)
           end
 
-        case Ash.create(config.resource, attrs, domain: domain, authorize?: config.authorize?) do
+        create_result =
+          Ash.create(config.resource, attrs,
+            domain: domain,
+            actor: authz_actor,
+            authorize?: config.authorize?
+          )
+
+        case create_result do
           {:ok, _} ->
             :ok
 
@@ -115,7 +148,7 @@ defmodule AshEnvelope.GrantRequests do
             # A concurrent create may have won the race against the
             # `unique_pending` identity. Re-check before reporting the
             # failure so duplicate-key conflicts surface as :ok (idempotent).
-            case lookup_pending(config, subject_id, target_id, domain) do
+            case lookup_pending(config, subject_id, target_id, domain, authz_actor) do
               {:ok, %_{}} -> :ok
               _ -> err
             end
@@ -128,14 +161,20 @@ defmodule AshEnvelope.GrantRequests do
 
   @doc """
   Return all unfulfilled requests for `subject_id`.
+
+  **Authorization:** policies see `opts[:actor]` (defaults to `nil`).
   """
   @spec list_pending_for_subject(Config.t(), term(), module(), keyword()) ::
           {:ok, [Ash.Resource.record()]} | {:error, term()}
-  def list_pending_for_subject(%Config{} = config, subject_id, domain, _opts \\ []) do
+  def list_pending_for_subject(%Config{} = config, subject_id, domain, opts \\ []) do
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> filter_pending(config)
-    |> Ash.read(domain: domain, authorize?: config.authorize?)
+    |> Ash.read(
+      domain: domain,
+      actor: Keyword.get(opts, :actor),
+      authorize?: config.authorize?
+    )
   end
 
   @doc """
@@ -146,26 +185,31 @@ defmodule AshEnvelope.GrantRequests do
   to the matching subject ids in the database (rather than reading every
   pending row into memory). Cheap when the actor holds a bounded number
   of grants.
+
+  **Authorization:** both reads run with `actor` as the Ash actor
+  (override via `opts[:actor]`).
   """
-  @spec list_fulfillable_for(Config.t(), KeyGrants.Config.t(), term(), module()) ::
+  @spec list_fulfillable_for(Config.t(), KeyGrants.Config.t(), term(), module(), keyword()) ::
           {:ok, [Ash.Resource.record()]} | {:error, term()}
   def list_fulfillable_for(
         %Config{} = config,
         %KeyGrants.Config{} = grants_config,
         actor,
-        domain
+        domain,
+        opts \\ []
       ) do
     case principal_id(actor) do
       nil ->
         {:error, :missing_principal}
 
       actor_id ->
-        do_list_fulfillable_for(config, grants_config, actor_id, domain)
+        authz_actor = Keyword.get(opts, :actor, actor)
+        do_list_fulfillable_for(config, grants_config, actor_id, authz_actor, domain)
     end
   end
 
-  defp do_list_fulfillable_for(config, grants_config, actor_id, domain) do
-    with {:ok, grants} <- list_actor_grants(grants_config, actor_id, domain) do
+  defp do_list_fulfillable_for(config, grants_config, actor_id, authz_actor, domain) do
+    with {:ok, grants} <- list_actor_grants(grants_config, actor_id, authz_actor, domain) do
       actor_subject_ids =
         grants
         |> Enum.map(&Map.get(&1, grants_config.subject_id_attribute))
@@ -185,22 +229,29 @@ defmodule AshEnvelope.GrantRequests do
             |> Ash.Query.filter(^[{target_attr, [not_eq: actor_id]}])
             |> filter_pending(config)
 
-          Ash.read(query, domain: domain, authorize?: config.authorize?)
+          Ash.read(query, domain: domain, actor: authz_actor, authorize?: config.authorize?)
       end
     end
   end
 
   @doc """
   Fulfill a single pending request: re-wrap the DEK from `actor` to the
-  request's target user via `KeyGrants.share/5`, then mark the row
+  request's target user via `KeyGrants.share/6`, then mark the row
   fulfilled.
 
   Caller is responsible for loading `target_actor` (target principal +
-  their public key). The request row carries the target id; this function
-  does not load it.
+  their public key — the target's private key is never needed). The
+  request row carries the target id; `target_actor` must be that
+  principal. A `target_actor` whose id differs from the request's
+  target returns `{:error, :target_mismatch}` without sharing anything.
 
-  Concurrent fulfillment is safe: the update conditions on
-  `is_nil(fulfilled_at)`, so a second fulfiller simply gets `:ok`.
+  Concurrent fulfillment is convergent: the row is re-read before the
+  update and skipped once `fulfilled_at` is set, so a second fulfiller
+  simply gets `:ok`.
+
+  **Authorization:** the request read/update and the underlying share
+  run with `actor` as the Ash actor (override the request-side actor
+  via `opts[:actor]`).
 
   Returns `:ok` on success or `{:error, reason}` otherwise.
   """
@@ -210,7 +261,8 @@ defmodule AshEnvelope.GrantRequests do
           Ash.Resource.record(),
           term(),
           term(),
-          module()
+          module(),
+          keyword()
         ) ::
           :ok | {:error, term()}
   def fulfill(
@@ -219,32 +271,53 @@ defmodule AshEnvelope.GrantRequests do
         request,
         actor,
         target_actor,
-        domain
+        domain,
+        opts \\ []
       ) do
-    if Map.get(request, config.fulfilled_at_attribute) do
-      :ok
-    else
-      subject_id = Map.get(request, config.subject_id_attribute)
+    request_target_id = Map.get(request, config.target_principal_id_attribute)
 
-      with :ok <- KeyGrants.share(grants_config, subject_id, actor, target_actor, domain),
-           {:ok, fresh} <-
-             Ash.get(config.resource, request.id, domain: domain, authorize?: config.authorize?),
-           :ok <- ensure_pending(fresh, config) do
-        attrs = %{
-          config.fulfilled_at_attribute => DateTime.utc_now(),
-          config.fulfilled_by_attribute => principal_id(actor)
-        }
+    cond do
+      Map.get(request, config.fulfilled_at_attribute) ->
+        :ok
 
-        case Ash.update(fresh, attrs, domain: domain, authorize?: config.authorize?) do
-          {:ok, _} -> :ok
-          {:error, _} = err -> err
-        end
-      else
-        # `share/5` succeeded but a concurrent fulfiller already flipped the
-        # request — both outcomes are equivalent from the caller's POV.
-        :already_fulfilled -> :ok
+      principal_id(target_actor) != request_target_id ->
+        {:error, :target_mismatch}
+
+      true ->
+        do_fulfill(config, grants_config, request, actor, target_actor, domain, opts)
+    end
+  end
+
+  defp do_fulfill(config, grants_config, request, actor, target_actor, domain, opts) do
+    authz_actor = Keyword.get(opts, :actor, actor)
+    subject_id = Map.get(request, config.subject_id_attribute)
+
+    get_opts = [domain: domain, actor: authz_actor, authorize?: config.authorize?]
+
+    with :ok <- KeyGrants.share(grants_config, subject_id, actor, target_actor, domain),
+         {:ok, fresh} <- Ash.get(config.resource, request.id, get_opts),
+         :ok <- ensure_pending(fresh, config) do
+      attrs = %{
+        config.fulfilled_at_attribute => DateTime.utc_now(),
+        config.fulfilled_by_attribute => principal_id(actor)
+      }
+
+      update_result =
+        Ash.update(fresh, attrs,
+          domain: domain,
+          actor: authz_actor,
+          authorize?: config.authorize?
+        )
+
+      case update_result do
+        {:ok, _} -> :ok
         {:error, _} = err -> err
       end
+    else
+      # `share/6` succeeded but a concurrent fulfiller already flipped the
+      # request — both outcomes are equivalent from the caller's POV.
+      :already_fulfilled -> :ok
+      {:error, _} = err -> err
     end
   end
 
@@ -257,10 +330,15 @@ defmodule AshEnvelope.GrantRequests do
 
   @doc """
   For every pending request `actor` can fulfill, load the target principal
-  via `target_loader` and call `fulfill/6`. Returns `{ok_count, error_count}`.
+  via `target_loader` and call `fulfill/7`. Returns `{ok_count, error_count}`.
 
   `target_loader` is `(target_principal_id -> {:ok, target_actor} | {:error, _})`
   — typically `&Ash.get(MyApp.User, &1, authorize?: false, load: [:public_key])`.
+  Loading only the target's public key is sufficient; nothing in the
+  fulfillment path needs the target's private key.
+
+  **Authorization:** policies see the fulfilling `actor` for every read,
+  create, and update along the way.
   """
   @spec fulfill_outstanding(
           Config.t(),
@@ -312,6 +390,10 @@ defmodule AshEnvelope.GrantRequests do
   Used by reconciliation when a target loses authorization on a subject —
   any pending request for them on that subject is no longer relevant.
 
+  Halts on the first destroy failure and returns its error tuple; rows
+  destroyed before the failure stay destroyed.
+
+  **Authorization:** policies see `opts[:actor]` (defaults to `nil`).
   `opts[:authorize?]` overrides `config.authorize?` for the read and the
   destroys. Trusted system paths (e.g. the reconcile runner, which has
   already made the authorization decision and runs without an actor) pass
@@ -320,20 +402,21 @@ defmodule AshEnvelope.GrantRequests do
   @spec revoke_pending_for(Config.t(), term(), term(), module(), keyword()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def revoke_pending_for(%Config{} = config, subject_id, target_id, domain, opts \\ []) do
+    actor = Keyword.get(opts, :actor)
     authorize? = Keyword.get(opts, :authorize?, config.authorize?)
 
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
-    |> Ash.read(domain: domain, authorize?: authorize?)
+    |> Ash.read(domain: domain, actor: actor, authorize?: authorize?)
     |> case do
       {:ok, requests} ->
-        Enum.reduce(requests, {:ok, 0}, fn req, {:ok, count} ->
-          case Ash.destroy(req, domain: domain, authorize?: authorize?) do
-            :ok -> {:ok, count + 1}
-            {:ok, _} -> {:ok, count + 1}
-            {:error, _} = err -> err
+        Enum.reduce_while(requests, {:ok, 0}, fn req, {:ok, count} ->
+          case Ash.destroy(req, domain: domain, actor: actor, authorize?: authorize?) do
+            :ok -> {:cont, {:ok, count + 1}}
+            {:ok, _} -> {:cont, {:ok, count + 1}}
+            {:error, _} = err -> {:halt, err}
           end
         end)
 
@@ -344,13 +427,13 @@ defmodule AshEnvelope.GrantRequests do
 
   # ---- private ----
 
-  defp lookup_pending(config, subject_id, target_id, domain) do
+  defp lookup_pending(config, subject_id, target_id, domain, actor) do
     config.resource
     |> Ash.Query.filter(^[{config.subject_id_attribute, subject_id}])
     |> Ash.Query.filter(^[{config.target_principal_id_attribute, target_id}])
     |> filter_pending(config)
     |> Ash.Query.limit(1)
-    |> Ash.read(domain: domain, authorize?: config.authorize?)
+    |> Ash.read(domain: domain, actor: actor, authorize?: config.authorize?)
     |> case do
       {:ok, [row | _]} -> {:ok, row}
       {:ok, []} -> {:ok, nil}
@@ -358,11 +441,11 @@ defmodule AshEnvelope.GrantRequests do
     end
   end
 
-  defp list_actor_grants(grants_config, actor_id, domain) do
+  defp list_actor_grants(grants_config, actor_id, authz_actor, domain) do
     grants_config.resource
     |> Ash.Query.filter(^[{grants_config.principal_id_attribute, actor_id}])
     |> Ash.Query.select([grants_config.subject_id_attribute])
-    |> Ash.read(domain: domain, authorize?: grants_config.authorize?)
+    |> Ash.read(domain: domain, actor: authz_actor, authorize?: grants_config.authorize?)
   end
 
   defp filter_pending(query, config) do
