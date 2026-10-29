@@ -44,12 +44,10 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
 
     @impl true
     def wrap_dek(dek, %Writer.Operation{blob_context: bctx}, opts) when is_binary(dek) do
-      with {:ok, public_key} <- resolve_public_key(bctx.actor, opts) do
+      with {:ok, public_key} <- resolve_public_key(bctx.actor, opts),
+           {:ok, ciphertext} <- wrap_for_recipient(dek, public_key) do
         {:ok,
-         %{
-           "format" => @format,
-           "ciphertext" => dek |> AshEnvelope.wrap_dek(public_key) |> Base.encode64()
-         }
+         %{"format" => @format, "ciphertext" => ciphertext}
          |> Backup.put_backup(Backup.wrap_for_backup(dek))}
       end
     end
@@ -83,18 +81,28 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
       with {:ok, donor_private_key} <- resolve_private_key(donor, opts),
            {:ok, recipient_public_key} <- resolve_public_key(bctx.actor, opts),
            {:ok, decoded} <- decode_base64(ciphertext),
-           {:ok, dek} <- AshEnvelope.unwrap_dek(decoded, donor_private_key) do
+           {:ok, dek} <- AshEnvelope.unwrap_dek(decoded, donor_private_key),
+           {:ok, rewrapped} <- wrap_for_recipient(dek, recipient_public_key) do
         {:ok,
-         %{
-           "format" => @format,
-           "ciphertext" => dek |> AshEnvelope.wrap_dek(recipient_public_key) |> Base.encode64()
-         }
+         %{"format" => @format, "ciphertext" => rewrapped}
          |> Backup.put_backup(Backup.from_wrapped_dek(wrapped_dek))}
       end
     end
 
     def rewrap_dek(_wrapped_dek, %RewrapOperation{}, _opts) do
       {:error, {:invalid_asymmetric_key_metadata, "wrapped_dek"}}
+    end
+
+    # `AshEnvelope.wrap_dek/2` raises ArgumentError when the recipient's
+    # public key is a degenerate/low-order X25519 point (e.g. 32 zero
+    # bytes). Inside the BlobIO pipeline that exception is caught and
+    # scrubbed to an opaque `:encryption_key_manager_exception`; a
+    # malformed actor key is a per-request error and belongs in the
+    # same `:invalid_actor_key` channel as a wrong-length key.
+    defp wrap_for_recipient(dek, public_key) do
+      {:ok, dek |> AshEnvelope.wrap_dek(public_key) |> Base.encode64()}
+    rescue
+      ArgumentError -> {:error, :invalid_actor_key}
     end
 
     defp resolve_public_key(actor, opts) do
