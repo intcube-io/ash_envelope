@@ -47,3 +47,4 @@ Two minor secondary techniques inform the result:
 | 2026-05-12 | Step 8: prioritize SRs from risk × category | `08_prioritization.md` |
 | 2026-05-12 | Step 9: inspect SRs (ambiguity, traceability, testability) | `09_inspection.md` |
 | 2026-05-12 | Finalize: overview + traceability matrix | `00_overview.md`, `traceability_matrix.md` |
+| 2026-10-29 | Review pass: map the October 2026 code-review findings and the PR #14 fixes onto existing threats, SRs and controls; re-rate T6; record open items | `04_risk_assessment.md`, `06_security_requirements.md`, `07_categorization.md`, `08_prioritization.md`, `09_inspection.md`, `traceability_matrix.md`, `00_overview.md` |
