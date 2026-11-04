@@ -35,6 +35,12 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequestsTest do
 
       assert notice =~ ~r/create :create do\s+primary\? true/
     end
+
+    test "the partial :unique_pending identity has its where clause as SQL" do
+      notice = notice(@base_argv)
+
+      assert notice =~ ~s{identity_wheres_to_sql unique_pending: "fulfilled_at IS NULL"}
+    end
   end
 
   describe "migration scaffold" do
@@ -59,6 +65,12 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequestsTest do
                ~r/add :fulfilled_by_id,\s+references\(:members, type: :uuid, on_delete: :nilify_all\)/
 
       refute notice =~ "references(:users"
+    end
+
+    test "the partial unique index has the name AshPostgres derives for the identity" do
+      notice = notice(@base_argv)
+
+      assert notice =~ "name: :document_grant_requests_unique_pending_index"
     end
 
     test "warns that inferred table names must be verified" do
