@@ -104,6 +104,10 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
       postgres do
         table "#{requests_table}"
         repo #{inspect(repo)}
+
+        # :unique_pending is a partial identity, so AshPostgres needs its
+        # `where` as SQL to generate (and check) the unique index.
+        identity_wheres_to_sql unique_pending: "fulfilled_at IS NULL"
       end
 
       attributes do
@@ -255,11 +259,13 @@ defmodule Mix.Tasks.AshEnvelope.Gen.GrantRequests do
       end
 
       # Partial unique index: only one *pending* request per (subject, target).
+      # The name is the one AshPostgres derives for the :unique_pending
+      # identity, so `mix ash.codegen` sees the index as already present.
       create unique_index(
                :#{requests_table},
                [:#{subject_id_attr}, :user_id],
                where: "fulfilled_at IS NULL",
-               name: :unique_pending_grant_request
+               name: :#{requests_table}_unique_pending_index
              )
 
       create index(:#{requests_table}, [:user_id])
