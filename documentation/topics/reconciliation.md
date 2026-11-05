@@ -34,18 +34,21 @@ defmodule MyApp.Document do
 
   storage do
     service {AshStorage.Service.S3, bucket: "private-blobs"}
+    blob_resource MyApp.DocumentBlob
+    attachment_resource MyApp.DocumentAttachment
 
-    layers [
-      {AshStorage.Layer.Encryption,
-       layer_id: "documents",
-       key_manager:
-         {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
-          grants_resource: MyApp.DocumentKeyGrant,
-          domain: MyApp.Catalog,
-          actor_public_key_attribute: :encryption_public_key,
-          actor_private_key_attribute: :encryption_private_key,
-          subject_id_attribute: :blob_id}}
-    ]
+    layer {AshStorage.Layer.Encryption,
+           key_manager:
+             {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
+              grants_resource: MyApp.DocumentKeyGrant,
+              domain: MyApp.Catalog,
+              actor_public_key_attribute: :encryption_public_key,
+              actor_private_key_attribute: :encryption_private_key,
+              subject_id_attribute: :blob_id},
+           proxy_base_url: "/storage"},
+          metadata_key: "documents"
+
+    has_one_attached :file
   end
 
   reconcile do
@@ -58,6 +61,13 @@ defmodule MyApp.Document do
     grant_requests_resource MyApp.DocumentGrantRequest
     granter_chain [:actor, :request]
     user_load [:encryption_private_key]
+
+    # The KeyGrants manager keys grants by the blob id (`bctx.blob.id`),
+    # so reconcile must derive the same id from a Document: walk the
+    # `:file` attachment to its `blob_id`. A Document without an
+    # attachment yields nil and is skipped.
+    subject_load [:file]
+    subject_id_for fn doc -> doc.file && doc.file.blob_id end
 
     affects MyApp.Membership do
       actions [:create, :update, :destroy]
@@ -100,7 +110,14 @@ mix ash_envelope.gen.grant_requests MyApp.Document \
 When the encrypted resource is an AshStorage attachment using the
 `KeyGrants` BlobIO key manager (as above), the same grants resource is
 referenced on both sides. Keep the values in `reconcile do` and the
-key-manager opts in sync — they read and write the same table.
+key-manager opts in sync — they read and write the same table. In
+particular both sides must agree on *which id* is the subject: the
+manager always uses the blob row's id (the owning record is not on the
+`BlobContext` for proxy, analyzer, or download reads), so `reconcile do`
+needs `subject_load` + `subject_id_for` to map a record to its blob id
+as shown above. Without them, reconcile looks grants up by the record id,
+never finds the manager's rows, and re-issues or queues requests for
+every pair on every pass.
 
 ### 2. Install the change on each affecting resource
 
@@ -131,6 +148,14 @@ end
 When the action's name isn't listed in the affects entry's `actions`,
 the change is a silent no-op — useful for actions you intentionally
 want to skip.
+
+On an `:update`, `SyncPrincipal` reconciles both the old and the new
+value of `principal` (a reassigned FK revokes the previous holder and
+grants the new one) and evaluates `scope` against both the changed
+changeset and a pre-change view, so a membership moved from org A to
+org B revokes the principal's grants on A's records as well as granting
+B's. Writing `scope` as `get_attribute(cs, …) || get_data(cs, …)`, as
+above, is what makes the pre-change evaluation resolve to the old value.
 
 #### Explicit overrides
 
@@ -184,6 +209,27 @@ Strategies are tried in order. Each returns `:ok` (granted), `:skip`
 Default chain is `[:actor, :request]`. Tuple-form strategies accept a
 `:when` predicate (`(target, ctx) -> boolean`) to gate which targets
 they fire for — see the moduledoc for `AshEnvelope.Reconcile.Granter`.
+
+## Multitenancy
+
+The tenant of the triggering changeset is captured into the reconcile
+`Context` and propagated everywhere the subsystem touches Ash:
+
+- subject enumeration (`SyncPrincipal`'s `scope`, including `:all`) and
+  `SyncSubject`'s candidate stream;
+- the `Ash.can?({subject, :read}, principal)` truth check;
+- all reads and writes against the user, encrypted, key-grants, and
+  grant-requests resources (via a `tenant:` option on the
+  `AshEnvelope.KeyGrants` / `AshEnvelope.GrantRequests` calls);
+- `:async` mode job args — the trigger serializes the tenant with
+  `Ash.ToTenant.to_tenant/2` and `AsyncWorker` restores it before
+  rebuilding the run. Context-multitenancy hosts must use a tenant
+  value that survives a JSON round-trip (string/integer).
+
+A `nil` tenant (single-tenant hosts) is passed through unchanged, so
+behavior is identical to previous releases. When calling `Runner.plan/2`
+or `Runner.apply_plan!/3` directly (e.g. the preview flow below), set
+`ctx.tenant` yourself alongside `ctx.actor`.
 
 ## Preview & confirm
 

@@ -131,25 +131,33 @@ mix ash_envelope.gen.key_grants MyApp.Document \
 
 This prints step-by-step instructions for setting up the grants resource, migration, and integration points.
 
+The scaffolded grants table is keyed by the attachment's **blob row**
+(`blob_id`), because that is the id the `KeyGrants` BlobIO manager sees
+on every read path. For grants over your own records (the field
+encryption pattern above), pass `--file-id-attribute` and point the
+migration's `references(...)` at your record table instead.
+
 ### 2. Use Key Grants in your code
 
 ```elixir
-# Build a config struct
+# Build a config struct (subject = the attachment's blob row)
 config = %AshEnvelope.KeyGrants.Config{
   resource: MyApp.FileKeyGrant,
-  subject_id_attribute: :document_id,
+  subject_id_attribute: :blob_id,
   actor_public_key_attribute: :encryption_public_key,
   actor_private_key_attribute: :encryption_private_key
 }
 
+blob_id = document.file.blob_id
+
 # Create a grant when a record is created (wraps DEK with actor's public key)
-AshEnvelope.KeyGrants.create_for_actor(config, document.id, raw_dek, actor, MyApp.Catalog)
+AshEnvelope.KeyGrants.create_for_actor(config, blob_id, raw_dek, actor, MyApp.Catalog)
 
 # Resolve the DEK for an actor (unwraps with the actor's private key)
-{:ok, raw_dek} = AshEnvelope.KeyGrants.resolve_for_actor(config, document.id, actor, MyApp.Catalog)
+{:ok, raw_dek} = AshEnvelope.KeyGrants.resolve_for_actor(config, blob_id, actor, MyApp.Catalog)
 
 # Share access with another user (only needs the target's public key)
-AshEnvelope.KeyGrants.share(config, document.id, actor, target_user, MyApp.Catalog)
+AshEnvelope.KeyGrants.share(config, blob_id, actor, target_user, MyApp.Catalog)
 
 # Revoke access
 AshEnvelope.KeyGrants.revoke(grant_record, MyApp.Catalog)
@@ -178,20 +186,27 @@ defmodule MyApp.Document do
 
   storage do
     service {AshStorage.Service.S3, bucket: "private-blobs"}
+    blob_resource MyApp.DocumentBlob
+    attachment_resource MyApp.DocumentAttachment
 
-    layers [
-      {AshStorage.Layer.Encryption,
-       layer_id: "documents",
-       key_manager:
-         {AshEnvelope.BlobIO.KeyManagers.Asymmetric,
-          actor_public_key_attribute: :public_key,
-          actor_private_key_attribute: :private_key}}
-    ]
+    layer {AshStorage.Layer.Encryption,
+           key_manager:
+             {AshEnvelope.BlobIO.KeyManagers.Asymmetric,
+              actor_public_key_attribute: :public_key,
+              actor_private_key_attribute: :private_key},
+           proxy_base_url: "/storage"},
+          metadata_key: "documents"
 
     has_one_attached :file
   end
 end
 ```
+
+`storage do` takes one `layer` entity per layer (there is no `layers [...]`
+list). `metadata_key` is the stable identifier persisted in blob metadata:
+choose it once and never rename it, or existing blobs become unreadable.
+`blob_resource` and `attachment_resource` point at your `AshStorage.BlobResource`
+and `AshStorage.AttachmentResource` modules.
 
 For multi-recipient blobs, generate the grants scaffolding with
 `mix ash_envelope.gen.key_grants` and use the `KeyGrants` key manager;

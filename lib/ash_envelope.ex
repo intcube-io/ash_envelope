@@ -72,6 +72,10 @@ defmodule AshEnvelope do
   for the rationale and the threat model these primitives cover.
   """
 
+  @aes_256_gcm_iv_bytes 12
+  @aes_256_gcm_tag_bytes 16
+  @dek_bytes 32
+
   # -- Field encryption (AES-256-GCM with optional AAD) --
 
   @doc """
@@ -199,7 +203,9 @@ defmodule AshEnvelope do
   X25519 private key.
 
   Returns `{:ok, raw_dek}` (32-byte binary), `{:error, :malformed_blob}`
-  if the blob doesn't match the expected layout, or
+  if the blob doesn't match the expected layout (including an inner
+  ciphertext that is not exactly 32 bytes, so a successful unwrap can
+  never yield anything but a 32-byte DEK), or
   `{:error, :decryption_failed}` if authentication fails or the embedded
   ephemeral public key is a degenerate/low-order X25519 point (a blob
   carrying such a point is indistinguishable from a tampered one).
@@ -207,7 +213,7 @@ defmodule AshEnvelope do
   @spec unwrap_dek(binary(), binary()) ::
           {:ok, binary()} | {:error, :malformed_blob | :decryption_failed}
   def unwrap_dek(
-        <<eph_public::binary-32, iv::binary-12, tag::binary-16, ciphertext::binary>>,
+        <<eph_public::binary-32, iv::binary-12, tag::binary-16, ciphertext::binary-32>>,
         recipient_private_key
       )
       when byte_size(recipient_private_key) == 32 do
@@ -256,24 +262,48 @@ defmodule AshEnvelope do
   Resolve a 32-byte key from an actor struct attribute.
 
   Accepts a raw 32-byte binary or a base64-encoded string that decodes to
-  exactly 32 bytes.
+  exactly 32 bytes. Raises `ArgumentError` otherwise; see
+  `fetch_actor_key/2` for the non-raising variant.
   """
   @spec resolve_actor_key(term(), atom()) :: binary()
   def resolve_actor_key(actor, attr) do
+    case fetch_actor_key(actor, attr) do
+      {:ok, key} -> key
+      {:error, _} -> raise_invalid_actor_key!(attr, if(actor, do: Map.get(actor, attr)))
+    end
+  end
+
+  @doc """
+  Non-raising counterpart of `resolve_actor_key/2`.
+
+  Returns `{:ok, key}` for a raw 32-byte binary or a base64-encoded
+  string that decodes to exactly 32 bytes. Returns
+  `{:error, {:missing_actor_key, attr}}` when the actor is `nil` or the
+  attribute is `nil` (a principal that has not generated keys yet, or
+  one loaded without the key attribute), and
+  `{:error, {:invalid_actor_key, attr}}` for any other value. The key
+  bytes never appear in the error.
+  """
+  @spec fetch_actor_key(term(), atom()) ::
+          {:ok, binary()} | {:error, {:missing_actor_key | :invalid_actor_key, atom()}}
+  def fetch_actor_key(actor, attr) do
     raw = if actor, do: Map.get(actor, attr)
 
     case raw do
+      nil ->
+        {:error, {:missing_actor_key, attr}}
+
       <<key::binary-32>> ->
-        key
+        {:ok, key}
 
       raw when is_binary(raw) ->
         case Base.decode64(raw) do
-          {:ok, <<key::binary-32>>} -> key
-          _ -> raise_invalid_actor_key!(attr, raw)
+          {:ok, <<key::binary-32>>} -> {:ok, key}
+          _ -> {:error, {:invalid_actor_key, attr}}
         end
 
       _ ->
-        raise_invalid_actor_key!(attr, raw)
+        {:error, {:invalid_actor_key, attr}}
     end
   end
 
@@ -344,6 +374,13 @@ defmodule AshEnvelope do
 
   Same limitation as `recover_dek/2`: exactly one encryption layer, no
   other layered transforms.
+
+  The persisted `"iv"` and `"tag"` must decode to exactly 12 and 16
+  bytes, mirroring `AshStorage.Layer.Encryption`'s read path. Anything
+  else returns `{:error, {:invalid_encryption_layer_metadata, key}}`
+  rather than being handed to the AEAD, where a shortened tag would
+  weaken authentication. A backup wrap that does not yield a 32-byte DEK
+  returns `{:error, :decryption_failed}`.
   """
   @spec recover_plaintext(map() | struct(), binary(), binary()) ::
           {:ok, binary()} | {:error, term()}
@@ -353,8 +390,9 @@ defmodule AshEnvelope do
          {:ok, layer_metadata_key, layer_metadata} <- single_encryption_layer_entry(blob),
          {:ok, backup_wrap} <- fetch_backup_wrap(layer_metadata),
          {:ok, dek} <- AshEnvelope.BlobIO.Backup.unwrap_backup(backup_wrap, backup_private_key),
-         {:ok, iv} <- decode_base64(layer_metadata, "iv"),
-         {:ok, tag} <- decode_base64(layer_metadata, "tag") do
+         :ok <- validate_dek_length(dek),
+         {:ok, iv} <- decode_fixed(layer_metadata, "iv", @aes_256_gcm_iv_bytes),
+         {:ok, tag} <- decode_fixed(layer_metadata, "tag", @aes_256_gcm_tag_bytes) do
       aad = aes_256_gcm_aad(blob_key, layer_metadata_key)
 
       case :crypto.crypto_one_time_aead(:aes_256_gcm, dek, iv, ciphertext, aad, tag, false) do
@@ -363,6 +401,9 @@ defmodule AshEnvelope do
       end
     end
   end
+
+  defp validate_dek_length(dek) when byte_size(dek) == @dek_bytes, do: :ok
+  defp validate_dek_length(_dek), do: {:error, :decryption_failed}
 
   defp single_encryption_layer(blob_or_metadata) do
     with {:ok, _layer_metadata_key, metadata} <- single_encryption_layer_entry(blob_or_metadata) do
@@ -425,16 +466,17 @@ defmodule AshEnvelope do
 
   defp fetch_backup_wrap(_), do: {:error, :no_backup_wrap}
 
-  defp decode_base64(metadata, key) do
-    case Map.fetch(metadata, key) do
-      {:ok, value} when is_binary(value) ->
-        case Base.decode64(value) do
-          {:ok, decoded} -> {:ok, decoded}
-          :error -> {:error, {:invalid_encryption_layer_metadata, key}}
-        end
-
-      _ ->
-        {:error, {:invalid_encryption_layer_metadata, key}}
+  # Decode a base64 metadata field and enforce its exact byte length, as
+  # AshStorage.Layer.Encryption does on read. AES-GCM accepts tags of
+  # any length up to 16 bytes, so an unchecked tag field would let a
+  # metadata writer shorten the tag and make forgeries cheap.
+  defp decode_fixed(metadata, key, expected_size) do
+    with {:ok, value} when is_binary(value) <- Map.fetch(metadata, key),
+         {:ok, decoded} <- Base.decode64(value),
+         true <- byte_size(decoded) == expected_size do
+      {:ok, decoded}
+    else
+      _missing_or_invalid -> {:error, {:invalid_encryption_layer_metadata, key}}
     end
   end
 end

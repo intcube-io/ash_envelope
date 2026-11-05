@@ -61,7 +61,9 @@ defmodule AshEnvelope.SealKeyTest do
     end
 
     test "rejects non-binary input" do
-      assert_raise FunctionClauseError, fn -> SealKey.seal(:not_a_binary) end
+      # apply/3 keeps the deliberately ill-typed call out of the compile-time type checker.
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
+      assert_raise FunctionClauseError, fn -> apply(SealKey, :seal, [:not_a_binary]) end
     end
   end
 
@@ -80,6 +82,46 @@ defmodule AshEnvelope.SealKeyTest do
       Application.put_env(:ash_envelope, :seal_key, :crypto.strong_rand_bytes(32))
       assert {:ok, sealed} = SealKey.seal("payload")
       assert {:ok, "payload"} = SealKey.unseal(sealed)
+    end
+  end
+
+  describe "explicit :key override" do
+    test "round-trips with a raw 32-byte key and no app env" do
+      Application.delete_env(:ash_envelope, :seal_key)
+      key = :crypto.strong_rand_bytes(32)
+
+      assert {:ok, sealed} = SealKey.seal("payload", key: key)
+      assert {:ok, "payload"} = SealKey.unseal(sealed, key: key)
+    end
+
+    test "round-trips with a base64 key" do
+      key = Base.encode64(:crypto.strong_rand_bytes(32))
+
+      assert {:ok, sealed} = SealKey.seal("payload", key: key)
+      assert {:ok, "payload"} = SealKey.unseal(sealed, key: key)
+    end
+
+    test "takes precedence over the app env key" do
+      key = :crypto.strong_rand_bytes(32)
+
+      # Sealed under the explicit key; the (different) env key from the
+      # module setup must not be able to open it.
+      {:ok, sealed} = SealKey.seal("payload", key: key)
+
+      assert {:error, :decryption_failed} = SealKey.unseal(sealed)
+      assert {:ok, "payload"} = SealKey.unseal(sealed, key: key)
+    end
+
+    test "rejects a key that is not 32 bytes" do
+      assert {:error, :invalid_seal_key} =
+               SealKey.seal("payload", key: :crypto.strong_rand_bytes(16))
+
+      assert {:error, :invalid_seal_key} =
+               SealKey.seal("payload", key: Base.encode64(:crypto.strong_rand_bytes(16)))
+    end
+
+    test "rejects a non-binary key" do
+      assert {:error, :invalid_seal_key} = SealKey.seal("payload", key: :not_a_key)
     end
   end
 

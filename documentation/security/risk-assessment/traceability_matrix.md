@@ -63,25 +63,43 @@ SR1, SR11, SR12, SR18 and EA7 are retired in v0.3.0 (code paths removed). SR32 (
 | T23 | | | | | | | | | | | | | | | | | | | | | | | | | | | | | | | | |
 | T24 | | | | | | | | | | | | | | | | | | | | | | | | | | | ✓ | | | | | ✓ |
 
+## Threat → Requirement (2026-10 review pass)
+
+The wide table above predates SR32. For threats touched by the 2026-10 review pass, the complete set of treating requirements and controls is:
+
+| Threat | Risk after the pass | Requirements / assumptions | Controls | Open findings |
+|---|---|---|---|---|
+| T4 | Inacceptable (unchanged) | SR7, SR19, SR3, EA11 | C9, C36 | none |
+| T6 | Undesirable (re-rated: Inacceptable pre-fix) | SR8, SR36, SR37, SR39, SR34 | C12, C30, C31, C32, C33, C37, C38 | N7, N12, N13 (rated under T25), N15 |
+| T10 | Inacceptable (unchanged; C4 / C14 effective only from PR #14) | SR13, SR14, SR39, EA1, EA3 | C4, C14, C15, C34, C38 | N20, N21 |
+| T12 | Undesirable (unchanged) | SR15, SR38 | C10, C34, C35 | N16, N23, N10 residual |
+| T14 | Tolerable (unchanged) | SR3, SR17, EA8 | C2 | N11 |
+| T16 | Undesirable (unchanged) | SR20 | C19 | N5 residual, rotation clobber window |
+| T18 | Undesirable (unchanged) | SR21, SR24, SR25, SR26, EA10 | C20, C23, C24 | N17 |
+| T19 | Tolerable (unchanged) | SR23, SR13 | C22, C34 | N8 residual |
+| T25 | Undesirable (unchanged) | SR34 | C39 | N13 |
+
+Per-finding mapping (N1-N23 and the findings carried by the consolidated and merged PRs) is in `09_inspection.md`, "Findings & actions (2026-10 review pass)".
+
 ## Combined view
 
 | Req. | Goal(s) | Threat(s) | Asset(s) | Risk treated | Priority |
 |---|---|---|---|---|---|
 | SR2 | SG6, SG9 | T2 | A1, A8 | Tolerable | P1 |
-| SR3 | SG1, SG2, SG6 | T2, T14 | A1, A2 | Tolerable | P1 |
+| SR3 | SG1, SG2, SG6 | T2, T4, T14 | A1, A2 | Tolerable | P1 |
 | SR4 | SG6 | T2, T14 | A2 | defence in depth | P3 |
 | SR5 | SG3, SG7 | T3 | A3 | Inacceptable → Undesirable (when scaffolds used) | P1 |
 | SR6 | SG3, SG9 | T3 | A3 | Inacceptable (documented) | P1 |
 | SR7 | SG2, SG9 | T4 | A1, A4, A5 | Inacceptable (documented) | P1 |
-| SR8 | SG4, SG5 | T6 | A4, A6 | Undesirable → Tolerable | P1 |
+| SR8 | SG4, SG5, SG8 | T6 | A1, A4, A6 | Undesirable → Tolerable (Inacceptable on the pre-fix code, 2026-10 pass) | P1 |
 | SR9 | SG3 | T7 | A2, A3 | Undesirable → Tolerable | P1 |
 | SR10 | SG3 | T8 | A1, A2, A3 | Undesirable → Tolerable | P1 |
-| SR13 | SG4, SG7 | T10 | A4, A6 | Inacceptable → Undesirable (residual) | P1 |
+| SR13 | SG4, SG5, SG7 | T10 | A3, A4, A6 | Inacceptable → Undesirable (residual) | P1 |
 | SR14 | SG4 | T10 | A4 | Inacceptable residual → Undesirable | P2 |
 | SR15 | SG8 | T12 | A7 | Undesirable → Tolerable | P2 |
 | SR16 | SG6, SG9 | T13 | A6 | Undesirable (documented) | P2 |
 | SR17 | SG9 | T14 | A1, A2, A8 | Tolerable (monitored) | P2 |
-| SR19 | SG3, SG6 | T15 | A1, A2 | Undesirable | P1 (when in use) |
+| SR19 | SG2, SG3, SG6 | T15, T4 | A1, A2, A5 | Undesirable | P1 (when in use) |
 | SR20 | SG8 | T16 | A1 (Av) | Undesirable → Tolerable | P1 (when in use) |
 | SR21 | SG2, SG6 | T18 | A9, A10 | Undesirable (bounded) | P1 (when in use) |
 | SR22 | SG6, SG9 | T17, T18 | A9, A10 | forward-compat hatch | P3 |
@@ -98,6 +116,10 @@ SR1, SR11, SR12, SR18 and EA7 are retired in v0.3.0 (code paths removed). SR32 (
 | SR33 | SG2, SG8, SG9 | T23 | A5, A11 | Tolerable (documented) | P2 |
 | SR34 | SG4, SG5, SG6 | T25 | A4, A6 | Undesirable → Tolerable (test-locked) | P1 |
 | SR35 | SG3, SG9 | T26 | A8 | Tolerable (architectural constraint) | P2 |
+| SR36 | SG4, SG5 | T6 | A1, A4, A6 | Undesirable (Inacceptable pre-fix) | P1 (when multitenancy in use) |
+| SR37 | SG4, SG8 | T6 | A1, A4, A6 | Undesirable (Inacceptable pre-fix) | P1 |
+| SR38 | SG3, SG8 | T12, T8 | A6, A7, A2 | Undesirable (availability hardening) | P2 |
+| SR39 | SG4, SG5, SG7 | T6, T10 | A3, A4, A6 | Undesirable / Inacceptable (scaffold-induced) | P1 |
 | EA1 | SG4, SG7 | T10 | A1, A4 | enabler | P1 |
 | EA2 | SG3, SG7 | T2, T3 | A3 | enabler (**load-bearing**) | P1 |
 | EA3 | SG4 | T10, T20 | A4, A6 | enabler | P1 |

@@ -6,7 +6,16 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
   alias AshEnvelope.{GrantRequests, KeyGrants}
   alias AshEnvelope.Reconcile.{Context, Runner}
 
-  alias AshEnvelope.Test.Reconcile.{Document, Grant, GrantRequest, Membership, User}
+  alias AshEnvelope.Test.Reconcile.{
+    Document,
+    Grant,
+    GrantRequest,
+    MaybeDocument,
+    Membership,
+    PoliciedGrant,
+    PoliciedGrantRequest,
+    User
+  }
 
   require Ash.Query
 
@@ -116,6 +125,40 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       # No grant for the target — actor couldn't issue one.
       assert {:ok, nil} = grant_for(target, doc)
       # Pending request was created instead.
+      assert {:ok, %_{}} = pending_request_for(target, doc)
+    end
+
+    # The actor holds a grant, but it was wrapped to a public key they no
+    # longer own (keypair rotated afterwards). `:actor` used to surface
+    # the resulting `:decryption_failed` as a terminal error, halting the
+    # chain: the target ended up with neither a grant nor a pending
+    # request, and in sync mode nothing ever retried.
+    test ":actor whose key cannot open their grant falls through to :request" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      dek = AshEnvelope.generate_dek()
+      :ok = KeyGrants.create_for_actor(grants_config(), doc.id, dek, actor, @domain)
+
+      {new_pub, new_priv} = AshEnvelope.generate_key_pair()
+
+      {:ok, actor} =
+        Ash.update(actor, %{public_key: new_pub, private_key: new_priv},
+          domain: @domain,
+          authorize?: false
+        )
+
+      assert {:error, :decryption_failed} =
+               KeyGrants.resolve_for_actor(grants_config(), doc.id, actor, @domain)
+
+      ctx = build_context(actor)
+
+      log = capture_log(fn -> assert :ok = Runner.run(ctx, [{target.id, doc.id}]) end)
+      assert log =~ "cannot open its own grant"
+
+      assert {:ok, nil} = grant_for(target, doc)
       assert {:ok, %_{}} = pending_request_for(target, doc)
     end
 
@@ -253,10 +296,229 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
     end
   end
 
+  # The planner's grants-table reads are bookkeeping, not the security
+  # decision (`Ash.can?({subject, :read}, principal)` is). With an
+  # actor-scoped policy on the grants resource and `authorize?: true`
+  # config, the planner's nil-actor reads used to come back empty —
+  # existing grants were invisible, so stale grants were never revoked.
+  describe "policy-protected grants table" do
+    defp policied_grants_config do
+      %KeyGrants.Config{
+        resource: PoliciedGrant,
+        subject_id_attribute: :document_id,
+        actor_public_key_attribute: :public_key,
+        actor_private_key_attribute: :private_key,
+        authorize?: true
+      }
+    end
+
+    defp policied_requests_config do
+      %GrantRequests.Config{
+        resource: PoliciedGrantRequest,
+        subject_id_attribute: :document_id,
+        target_principal_id_attribute: :user_id,
+        authorize?: true
+      }
+    end
+
+    defp policied_context(actor) do
+      %{
+        build_context(actor)
+        | key_grants_config: policied_grants_config(),
+          grant_requests_config: policied_requests_config()
+      }
+    end
+
+    defp policied_grant_for(user, document) do
+      PoliciedGrant
+      |> Ash.Query.filter(document_id == ^document.id and user_id == ^user.id)
+      |> Ash.read_one(domain: @domain, authorize?: false)
+    end
+
+    test "plans and executes revocation of a stale grant under authorize?: true" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+
+      # Seed a grant the read policy no longer authorizes (no membership),
+      # plus a stale pending request. Seeding bypasses the table policies.
+      dek = AshEnvelope.generate_dek()
+      seed_config = %{policied_grants_config() | authorize?: false}
+      :ok = KeyGrants.create_for_actor(seed_config, doc.id, dek, target, @domain)
+
+      :ok =
+        GrantRequests.create(
+          %{policied_requests_config() | authorize?: false},
+          doc.id,
+          target,
+          actor,
+          @domain
+        )
+
+      ctx = policied_context(actor)
+
+      plan = Runner.plan(ctx, [{target.id, doc.id}])
+      assert [revocation] = plan.revocations
+      assert revocation.principal_id == target.id
+      assert revocation.subject_id == doc.id
+
+      :ok = Runner.apply_plan!(ctx, plan)
+
+      assert {:ok, nil} = policied_grant_for(target, doc)
+
+      assert {:ok, nil} =
+               PoliciedGrantRequest
+               |> Ash.Query.filter(document_id == ^doc.id and user_id == ^target.id)
+               |> Ash.Query.filter(is_nil(fulfilled_at))
+               |> Ash.read_one(domain: @domain, authorize?: false)
+    end
+
+    test "detects an existing grant under authorize?: true — no duplicate issuance" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      dek = AshEnvelope.generate_dek()
+      seed_config = %{policied_grants_config() | authorize?: false}
+      :ok = KeyGrants.create_for_actor(seed_config, doc.id, dek, target, @domain)
+
+      ctx = policied_context(actor)
+
+      plan = Runner.plan(ctx, [{target.id, doc.id}])
+      assert AshEnvelope.Reconcile.Plan.empty?(plan)
+    end
+  end
+
+  # `maybe_is: false` on the planner's `Ash.can?`: an unresolvable
+  # `:maybe` policy result must never be treated as authorization to
+  # issue a decryption grant.
+  describe "unresolvable policy checks" do
+    test "a :maybe read-policy result issues no grant and no request (fails closed)" do
+      actor = make_user(:user)
+      target = make_user(:user)
+
+      {:ok, doc} =
+        Ash.create(MaybeDocument, %{title: "maybe-doc"}, domain: @domain, authorize?: false)
+
+      # Sanity: the policy genuinely resolves to :maybe for this pair even
+      # with `run_queries?: true` — the default `maybe_is: true` would have
+      # coerced this to "authorized" and issued a grant.
+      assert {:ok, :maybe} = Ash.can({doc, :read}, target)
+      assert Ash.can?({doc, :read}, target)
+      refute Ash.can?({doc, :read}, target, maybe_is: false)
+
+      # The actor could grant if the planner said yes.
+      dek = AshEnvelope.generate_dek()
+      :ok = KeyGrants.create_for_actor(grants_config(), doc.id, dek, actor, @domain)
+
+      ctx = %{build_context(actor) | encrypted_resource: MaybeDocument}
+
+      plan = Runner.plan(ctx, [{target.id, doc.id}])
+      assert AshEnvelope.Reconcile.Plan.empty?(plan)
+
+      :ok = Runner.run(ctx, [{target.id, doc.id}])
+      assert {:ok, nil} = grant_for(target, doc)
+      assert {:ok, nil} = pending_request_for(target, doc)
+    end
+  end
+
+  # Expired rows count as absent for issuance (so reconcile re-issues per
+  # the `KeyGrants` contract) and as present for revocation (stale rows
+  # of unauthorized principals still get cleaned up).
+  describe "expired grants" do
+    defp expiring_grants_config do
+      %{grants_config() | expires_at_attribute: :expires_at}
+    end
+
+    defp expiring_context(actor) do
+      %{build_context(actor) | key_grants_config: expiring_grants_config()}
+    end
+
+    defp all_grants_for(user, document) do
+      Grant
+      |> Ash.Query.filter(document_id == ^document.id and user_id == ^user.id)
+      |> Ash.read!(domain: @domain, authorize?: false)
+    end
+
+    defp past, do: DateTime.add(DateTime.utc_now(), -60, :second)
+    defp future, do: DateTime.add(DateTime.utc_now(), 3600, :second)
+
+    test "expired row + policy still authorizes → stale row destroyed, fresh grant issued" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      dek = AshEnvelope.generate_dek()
+      config = expiring_grants_config()
+      :ok = KeyGrants.create_for_actor(config, doc.id, dek, actor, @domain)
+      :ok = KeyGrants.create_for_actor(config, doc.id, dek, target, @domain, expires_at: past())
+
+      [stale] = all_grants_for(target, doc)
+
+      ctx = expiring_context(actor)
+
+      plan = Runner.plan(ctx, [{target.id, doc.id}])
+      assert [%{principal_id: principal_id}] = plan.grants
+      assert principal_id == target.id
+      assert plan.revocations == []
+
+      :ok = Runner.apply_plan!(ctx, plan)
+
+      # Exactly one row remains, and it's a fresh one — the stale row was
+      # destroyed before issuance (a partial unique index on
+      # (subject, principal) would otherwise collide).
+      assert [fresh] = all_grants_for(target, doc)
+      refute fresh.id == stale.id
+
+      assert {:ok, resolved} = KeyGrants.resolve_for_actor(config, doc.id, target, @domain)
+      assert resolved == dek
+    end
+
+    test "expired row + policy no longer authorizes → row revoked" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+
+      dek = AshEnvelope.generate_dek()
+      config = expiring_grants_config()
+      :ok = KeyGrants.create_for_actor(config, doc.id, dek, target, @domain, expires_at: past())
+
+      ctx = expiring_context(actor)
+
+      plan = Runner.plan(ctx, [{target.id, doc.id}])
+      assert [%{principal_id: principal_id}] = plan.revocations
+      assert principal_id == target.id
+      assert plan.grants == []
+
+      :ok = Runner.apply_plan!(ctx, plan)
+      assert all_grants_for(target, doc) == []
+    end
+
+    test "unexpired row + policy authorizes → no-op" do
+      actor = make_user(:user)
+      target = make_user(:user)
+      doc = make_document()
+      _ = make_membership(target, doc)
+
+      dek = AshEnvelope.generate_dek()
+      config = expiring_grants_config()
+
+      :ok =
+        KeyGrants.create_for_actor(config, doc.id, dek, target, @domain, expires_at: future())
+
+      ctx = expiring_context(actor)
+      plan = Runner.plan(ctx, [{target.id, doc.id}])
+
+      assert AshEnvelope.Reconcile.Plan.empty?(plan)
+    end
+  end
+
   describe "plan/2" do
     alias AshEnvelope.Reconcile.Plan
 
-    test "lists pairs that should-grant under :grants", ctx do
+    test "lists pairs that should-grant under :grants", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -271,7 +533,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert grant.target.id == target.id
     end
 
-    test "lists pairs that should-revoke under :revocations", ctx do
+    test "lists pairs that should-revoke under :revocations", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -288,7 +550,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert revocation.subject_id == doc.id
     end
 
-    test "no-op pairs produce an empty plan", ctx do
+    test "no-op pairs produce an empty plan", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -299,7 +561,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert Plan.empty?(plan)
     end
 
-    test "writes nothing — calling plan/2 doesn't touch the grants table", ctx do
+    test "writes nothing — calling plan/2 doesn't touch the grants table", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -316,7 +578,7 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
   describe "apply_plan!/3" do
     alias AshEnvelope.Reconcile.Plan
 
-    test "executes the same writes as run/2", ctx do
+    test "executes the same writes as run/2", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()
@@ -332,12 +594,12 @@ defmodule AshEnvelope.Reconcile.RunnerTest do
       assert {:ok, %_{}} = grant_for(target, doc)
     end
 
-    test "returns :ok on an empty plan without raising", ctx do
+    test "returns :ok on an empty plan without raising", _ctx do
       reconcile_ctx = build_context(make_user(:user))
       assert :ok = Runner.apply_plan!(reconcile_ctx, %Plan{})
     end
 
-    test "transaction: false bypasses the wrapper (smoke)", ctx do
+    test "transaction: false bypasses the wrapper (smoke)", _ctx do
       actor = make_user(:user)
       target = make_user(:user)
       doc = make_document()

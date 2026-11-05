@@ -146,6 +146,8 @@ Affected: A1 (I), A4 (I), A5 (I). DBA replaces ciphertext for record R with atta
 
 **RAP: No rating** (max = 9).
 
+**2026-10 review pass (recovery path).** `AshEnvelope.recover_plaintext/3` passed the `"iv"` and `"tag"` from blob metadata to the AEAD without length checks. AES-GCM verifies a shortened tag as a shortened tag, so a metadata writer could truncate the tag to one byte and get a tampered ciphertext accepted on the recovery path with probability 2^-8 instead of 2^-128 (N1). This is a cheaper variant of the integrity attack T4 already rates (the same adversary can substitute the whole envelope, including the backup wrap, using public keys only), so the T4 rating is unchanged; it did, however, violate SG2 ("AEAD verification must fail closed"). PR #14 enforces 12-byte IV, 16-byte tag and 32-byte DEK on the recovery path (C36, SR19).
+
 ### T5: DBA row-shuffling (MC2/MC3)
 
 Affected: A1 (Av). DBA swaps wrap blobs between rows; decryption returns `:decryption_failed` for affected records.
@@ -166,6 +168,33 @@ Affected: A1 (C), A4 (I), A6 (I). A defect in granter-chain logic or `Ash.can?` 
 | **Sum** | **13** | **15** |
 
 **RAP: Low** (max = 15).
+
+**Scope note (2026-10 review pass).** T6 covers every way the persisted grant state can diverge from the read policy: a grant issued to a principal the policy does not authorize, a grant that is not revoked after the policy stops authorizing (SR8 (b)), and a legitimate principal left without grant or pending request (SG8). The October 2026 review findings below all land here.
+
+**Re-rating (2026-10 review pass).** The Undesirable rating above rested on a false premise: that the planner and the apply side behave as SR8 states and C12 claims. The review showed that, on `main` at b799f14 and before, they did not:
+
+- The planner's grant-existence read honoured `config.authorize?` (default `true`) with no actor, so on a policy-protected grants table every existence check came back empty and stale grants were never planned for revocation (fail-open). C12 assumed the planner saw the grants.
+- `Ash.can?` ran with the default `maybe_is: true`, so an unresolvable `:maybe` policy result authorized issuing a grant.
+- A scope function returning `[]` was treated as an empty keyword filter and matched the whole encrypted table.
+- No tenant was threaded through the planner, apply side, scope streams or async job args; on attribute-multitenant resources `scope :all` and `SyncSubject` issued and revoked grants across tenants.
+- An update that changed the scope input (a membership moved from record A to record B) never reconciled A, so the principal kept the wrapped DEK for A (review finding N2).
+- `mix ash_envelope.gen.key_grants` keyed scaffolded grants by the owning record id while the `KeyGrants` BlobIO manager keys them by blob id, so reconcile never found (and never revoked) the manager's rows (N19).
+- `Runner.run/3` returned `:ok` unconditionally and the async worker returned `:ok` on failure, so a failed revocation was logged and never retried (fixed by the merged PR #8).
+
+None of these needs attacker skill: a de-authorized principal keeps a working grant through ordinary use of an integrator configuration the library documents or scaffolds. Corrected rating for the pre-fix code:
+
+| Factor | Identification | Exploitation |
+|---|---|---|
+| Elapsed Time | < 1 day (2) | < 0.5 hour (0) |
+| Expertise | Layman (0) | Layman (0) |
+| Knowledge of target | Public (2) | Public (2) |
+| Access to target | < 0.5 hour (0) | < 0.5 hour (0) |
+| Equipment | None (0) | Standard (2) |
+| **Sum** | **4** | **4** |
+
+**RAP (pre-fix, corrected): No rating** (max = 4). Damage High → **Inacceptable**.
+
+After PR #14 (planner reads system-side and expiry-aware, `maybe_is: false`, empty scope means no subjects, pre- and post-change scope reconciled on update, tenant propagated end to end, scaffolds keyed by blob id) together with the merged PR #8 (failures surfaced, async jobs retried), the defects above are fixed and regression-tested (C30-C33, C37, C38). Finding a further defect again requires the analysis effort of the original table, so the RAP returns to **Low** and the risk to **Undesirable**. This is a reduction, not a closure: three reconcile findings remain open (N7 oversized scope drops the whole reconciliation, N12 deleted principal keeps grants, N13 unvalidated `affects` entries; see `09_inspection.md`), plus N15 (non-injective `subject_id_resolver` binds a later blob to an earlier blob's DEK, an SG5 violation outside reconcile).
 
 ### T7: Key material leaked via async Oban job args (MC13)
 
@@ -216,6 +245,13 @@ Affected: A1 (C), A4 (I). Library accepts `share`/`revoke` calls and Ash policie
 
 **RAP: No rating** (max = 6). The library defends partially via `authorize?: true` defaults; residual risk is the integrator's policy definitions.
 
+**Control-effectiveness correction (2026-10 review pass).** The rating stays **Inacceptable** (it is already the matrix maximum), but two control claims behind the "partially mitigated" wording were false on `main` at b799f14:
+
+- **C4.** Every `KeyGrants` and `GrantRequests` Ash call ran with `actor: nil` under `authorize?: true`. Actor-scoped policies such as the scaffolded `user_id == ^actor(:id)` could never match, so the default either refused every call or pushed integrators to `authorize?: false`, which removes the policy layer altogether. The ephemeral worker path of the `KeyGrants` BlobIO manager had the same shape (N8). `GrantRequests.fulfill/6` also did not check that `target_actor` was the request's target, so a grant could be issued to whichever principal the caller's loader returned.
+- **C14.** `assert_policies_defined!/2` accepted `policy always() do authorize_if always() end` as coverage, so the helper passed for a wide-open grants resource while its documentation claimed it caught authorization bypasses.
+
+PR #14 threads a real actor through every call (C34), makes the ephemeral and reconcile bookkeeping paths explicitly system-side, rejects a mismatched fulfil target with `{:error, :target_mismatch}`, and extends the helper to reject vacuous permissive coverage (C14). The merged PR #5 removed a scaffolded LiveView revoke handler that let any authenticated user revoke any grant by id (MC8). With these, the "partially mitigated" statement holds for the first time; the residual is still integrator policy correctness (EA3).
+
 ### T11: BEAM host side-channel (MC5)
 
 **Excluded** per EA5 (host OS / BEAM node integrity not in scope). The DEK lives in heap memory only for the duration of the encryption/decryption call; no process-dictionary handoff is used (BlobIO carries the DEK through a typed `Writer.Operation`).
@@ -234,6 +270,8 @@ Affected: A6 (Av). Authenticated user calls `revoke` repeatedly or triggers `Gra
 | **Sum** | **2** | **4** |
 
 **RAP: No rating** (max = 4). Library defends partially via `authorize?: true` and request idempotency; integrator-side rate-limiting handles the rest.
+
+**2026-10 review pass.** A second DoS vector of the same class: a principal whose key attribute is missing, malformed or a degenerate X25519 point made `KeyGrants.create_for_actor`, `resolve_for_actor` and the `Asymmetric` manager raise instead of returning an error tuple (N9, N10, merged PR #3), and a crafted wrap with a short inner ciphertext made `unwrap_dek/2` return a non-32-byte "DEK" that crashed the read pipeline (N3). In batch paths (`GrantRequests.fulfill_outstanding/5`, the reconcile granter chain) one such principal aborted the run for everyone else. PR #14 converts these to error tuples (SR38, C35). Rating unchanged. Residual: `KeyGrants.create_for_actor/6` and `share/6` still call `wrap_dek/2` unguarded for a degenerate public key (open, see `09_inspection.md`).
 
 ### T13: Grant-relationship metadata disclosure (MC7)
 
@@ -279,6 +317,8 @@ Affected: A1 (Av), specifically the backup-recovery path. If the integrator rota
 | **Sum** | **2** | **4** |
 
 **RAP: No rating** (max = 4). Operationally trivial — a single CLI mis-step. Mitigation: `mix ash_envelope.rotate_backup_key` exits non-zero if any blob remains wrapped to a non-current key after the pass, and supports `--check-only` for a no-write pre-flight.
+
+**2026-10 review pass.** The C19 claim (T16 drops to Tolerable once the CLI is part of the runbook) rested on the premise that "`key_id` equals the current fingerprint" implies "backup wrap opens to the blob's DEK". That premise was false: rotation unwrapped the DEK from the streamed snapshot and wrote it into a re-fetched row, so a blob whose envelope changed in between ended up with a backup wrap of the old DEK tagged as current, which the final check can never flag (N4). Per-blob failure reasons were also dropped, so a wrong previous key looked like ordinary staleness (N5), and before the merged PR #5 a misspelled switch (e.g. a typo of `--check-only`) was silently discarded and the task proceeded to writes. PR #14 rotates from the freshly read row, treats an already-current fresh row as a no-op, and reports failures by reason (C19). The 4c rating (Undesirable) is unchanged; the Tolerable-with-runbook claim holds again for the tool itself. Residual: the read-modify-write on blob metadata still has a millisecond clobber window against concurrent metadata writers (needs optimistic locking upstream), and the task cannot pass `actor`, `authorize?` or `tenant`, so policy-protected or multitenant blob resources fail per blob (now visibly).
 
 ### T9: Encrypted-blob proxy bypass (returned to scope in v0.4-dev)
 
@@ -349,6 +389,8 @@ Comparison with T15 (backup-key compromise):
 | Blast radius | Every blob ever written | Only blobs with live ephemeral rows |
 | Time-bounded? | No (until backup key rotated) | Yes (TTL) |
 
+**2026-10 review pass.** The TTL bound holds on the library's own path (the `KeyGrants` BlobIO manager never passes `:expires_at`), but `KeyGrants.create_ephemeral/5` accepts an explicit `expires_at: nil` from a direct caller and writes a row that is never purged and resolves indefinitely (N17, open). The rating stays Undesirable because the default path is bounded; SR25's "respected unconditionally" wording is not yet met for direct callers.
+
 ### T19: `renew_ephemeral/5` misuse → worker-pathway DoS
 
 Affected: A9 (Av), analyzer pipeline availability only.
@@ -367,6 +409,8 @@ A caller invokes the lower-level `renew_ephemeral/5` with a DEK that doesn't mat
 **RAP: No rating** (max = 4).
 
 **Damage potential: Normal.** Worker-pathway availability only. Recovery: call `renew_ephemeral_with_actor/5` with the correct authority. Mitigated by API shape (the `_with_actor` variant is documented as the primary admin path; the bare `renew_ephemeral/5` is reserved for backup-escrow flows).
+
+**2026-10 review pass.** `renew_ephemeral/5` destroyed the live row before sealing the replacement, so a missing or invalid seal key turned a renewal into a revocation of the worker pathway. PR #14 seals first and restores the previous row best-effort if the insert fails (C22, SR23). Rating unchanged (Tolerable). Separately, the ephemeral create and resolve inside the `KeyGrants` BlobIO manager ran under `config.authorize?` with no actor and no principal, so under scaffold-shaped policies every attach with expiring grants configured failed (N8); PR #14 runs those two paths system-side (C34). `renew_ephemeral_with_actor/5` still runs its destroy and create under `config.authorize?` with the renewing actor, which an actor-scoped policy on a principal-less row will not admit; this residual of N8 is open.
 
 ### T20: Time-bounded user grant outlives the policy intent
 
@@ -514,6 +558,15 @@ controls if the bug routes a grant to the wrong principal).
 which between them cover transformer happy + sad paths. **SR34** locks the
 test-coverage obligation so the suite cannot quietly regress.
 
+**2026-10 review pass.** `ValidateConfig` accepted the default granter
+chain (`[:actor, :request]`) without `grant_requests_resource`, unknown
+granter strategy shapes, and `mode :async` without Oban compiled; all three
+failed only at runtime. PR #14 turns them into compile-time `DslError`s
+(C39). The `affects` side is still unvalidated: a typo in `principal` or in
+`actions` compiles and makes the entry a silent no-op, so destroys may never
+revoke (N13, open; a compile-time check is blocked by the compile cycle).
+Rating unchanged (Undesirable).
+
 ### T26: Generator argument abuse — `mix ash_envelope.gen.*`
 
 Affected: A8 (library reputation). No other asset because the generators
@@ -565,6 +618,8 @@ Affected: A1 (C), A2 (C), A8 (I). BSI horizon shifts or a primitive break is ann
 
 **RAP: High (not practical)** under BSI horizon 2030. Quantum-capable adversaries out of scope per EA8.
 
+**2026-10 review pass.** The ECIES KDF uses the ephemeral public key as HKDF salt and a fixed info label; the recipient public key is not part of the KDF transcript (HPKE binds both), and the raw `wrap_dek/2` output carries no version byte, unlike the `SealKey` format (SR22). No concrete exploit was found; this is hardening and an algorithm-agility gap that would make a future primitive change (the T14 scenario) a dual-read migration (N11, open). Rating unchanged.
+
 ## 4c. Risk rating
 
 | # | Threat | Damage | RAP | **Risk** | Notes |
@@ -572,15 +627,15 @@ Affected: A1 (C), A2 (C), A8 (I). BSI horizon shifts or a primitive break is ann
 | T2 | `Asymmetric` / `KeyGrants` KeyManager + DBA, EA2 holds | High | High (not practical) | **Tolerable** | Cryptographic infeasibility. Monitor BSI horizon. |
 | **T3** | EA2 violation: priv keys in DB plaintext | High | No rating | **Inacceptable** | Integrator-side anti-pattern; library cannot enforce. Response: documentation + generator scaffolds that KEK-encrypt private-key columns by default. |
 | **T4** | DBA forges entire envelope | High | No rating | **Inacceptable** | Library does not cryptographically prevent. Response: document the integrity bound; integrators with DBA-class threats requiring forgery resistance layer signed audit / append-only / WORM atop the library. |
-| T6 | Reconciliation bug → wrong-principal grant | High | Low | **Undesirable** | Response: reconciliation invariant tests + property tests for `Runner.plan`/`apply_plan!`. |
+| T6 | Reconciliation bug → wrong-principal grant | High | Low | **Undesirable** | Response: reconciliation invariant tests + property tests for `Runner.plan`/`apply_plan!`. 2026-10 pass: was Inacceptable on the pre-fix code (planner fail-open, `maybe_is: true`, empty-scope and cross-tenant fan-out, moved-scope stale grants); reduced back to Undesirable by PR #14 and the merged PR #8 (SR8, SR36, SR37, SR39). Open: N7, N12, N13, N15. |
 | T7 | Key material in async job args (regression) | High | Low | **Undesirable** | Response: CI test asserting no key material in `Oban.Job.args` for async-mode dispatch. |
 | T8 | Plaintext / keys in logs (regression) | High | Low | **Undesirable** | Response: CI test scanning log output across the public API for entropy-suggestive byte sequences. |
-| **T10** | Authorization bypass via integrator policy gap | High | No rating | **Inacceptable** | Library defends via defaults (`authorize?: true`). Residual risk is downstream. Response: documentation, test helper, generator-scaffolded policies. |
-| T12 | DoS via revoke / request flooding | Normal | No rating | **Undesirable** | Library partial defence (idempotency, `authorize?`). Documented as integrator-side concern. |
+| **T10** | Authorization bypass via integrator policy gap | High | No rating | **Inacceptable** | Library defends via defaults (`authorize?: true`). Residual risk is downstream. Response: documentation, test helper, generator-scaffolded policies. 2026-10 pass: C4 and C14 did not work as claimed before PR #14 (nil actor on every grant call; helper accepted vacuous policies); now actor-threaded (SR13) and vacuous coverage rejected (SR14). |
+| T12 | DoS via revoke / request flooding | Normal | No rating | **Undesirable** | Library partial defence (idempotency, `authorize?`). Documented as integrator-side concern. 2026-10 pass: malformed or degenerate principal keys no longer abort batch paths (SR38). |
 | **T13** | Grant-relationship metadata disclosure to DBA | Normal | No rating | **Undesirable** | Inherent to design. Documented limitation; possible bump to Inacceptable for premium-sensitive deployments (then design pivots, e.g. encrypted-index schemes — out of v1 scope). |
 | T14 | Crypto primitive deprecation | High | High (not practical) | **Tolerable** | Monitor BSI TR-02102 horizon; rotate algorithms before deprecation. |
 | T15 | Backup-key compromise → mass disclosure | High | Low (under EA9) | **Undesirable** (Tolerable when EA9 holds firmly) | Backup escrow is opt-in (`:backup_public_key` unset by default). Custody is integrator-side (EA9); blast radius is broad by design. |
-| T16 | Backup-key rotation incomplete → backup-path availability loss | High (Av-only) | No rating | **Undesirable** | Mitigated by `mix ash_envelope.rotate_backup_key` (SR19) — fails non-zero if any blob remains stale; `--check-only` for pre-flight. |
+| T16 | Backup-key rotation incomplete → backup-path availability loss | High (Av-only) | No rating | **Undesirable** | Mitigated by `mix ash_envelope.rotate_backup_key` (SR19) — fails non-zero if any blob remains stale; `--check-only` for pre-flight. 2026-10 pass: rotation now re-wraps from the stored row and reports failure reasons; strict switch parsing (SR20). |
 | T17 | Env seal key disclosure alone (A10 leak without DB read) | Negligible | Low | **Negligible** | Layered-defence property: the seal key alone unlocks nothing without the corresponding rows. |
 | T18 | Env seal key + DB read → mass disclosure of in-flight plaintext | High | Low (under EA10) | **Undesirable** | Opt-in via SR24; bounded by TTL × write rate; AAD on the seal prevents row-shuffling. |
 | T19 | `renew_ephemeral/5` misuse → worker-pathway DoS | Normal | No rating | **Tolerable** | Mitigated by API shape (SR23): `renew_ephemeral_with_actor/5` is the primary admin path. |
@@ -590,7 +645,7 @@ Affected: A1 (C), A2 (C), A8 (I). BSI horizon shifts or a primitive break is ann
 | T22 | Direct-upload bypass attempt vs encrypted attachment | Normal (DoS) | No rating | **Tolerable** | Encryption layer rejects direct uploads (`AshStorage.Layer.Encryption.direct_upload/2` returns error). SR28 locks the rejection. |
 | T23 | Mirror service partial-write orphans | Normal (Av/I) | No rating | **Tolerable** | Integrator-owned: monitor partial failures, reconcile orphans. AEAD prevents tamper-without-detection. |
 | T24 | Storage-service credential leak | High (under writable) | Low | **Undesirable** | EA11 (credential custody) + SR30 (documented). Read-only credentials don't break A1 confidentiality; write-capable enables T4. |
-| T25 | Spark DSL transformer / verifier silently accepts misconfig | High | Low | **Undesirable** | SR34 locks transformer happy + sad path test coverage. Existing test suite (`validate_config_test.exs`, `affecting_extension_test.exs`) already covers the surface; SR formalizes the obligation. |
+| T25 | Spark DSL transformer / verifier silently accepts misconfig | High | Low | **Undesirable** | SR34 locks transformer happy + sad path test coverage. Existing test suite (`validate_config_test.exs`, `affecting_extension_test.exs`) already covers the surface; SR formalizes the obligation. 2026-10 pass: granter-chain, `grant_requests_resource` and async-without-Oban checks added; `affects` validation open (N13). |
 | T26 | Generator argument abuse (`mix ash_envelope.gen.*`) | Normal | No rating | **Tolerable** | Generators emit notices only — no auto-file-writes. SR35 locks the invariant. |
 
 Out-of-scope (not in matrix): T5 (DBA DoS, intrinsic class), T11 (host side-channel, EA5). T9 returns to scope in v0.4-dev (see scope expansion in `00_overview.md`).
@@ -616,6 +671,19 @@ The Inacceptable findings each have a documented response (above) and drive the 
 - T24 always applies when storage is used (any service adapter requires credentials).
 
 Deployments that don't enable a given feature retain the corresponding pre-feature risk profile exactly.
+
+### What changed in the 2026-10 review pass
+
+No threat is added or retired and the matrix counts above are unchanged. One threat was re-rated because its earlier rating rested on a control that did not work:
+
+- **T6**: Undesirable (as assessed in v0.4-dev) → **Inacceptable** (corrected, for the code on `main` up to b799f14) → **Undesirable** (after PR #14 and the merged PR #8). The planner could not see grants on a policy-protected grants table, so the SR8 (b) revocation invariant and C12 did not hold; empty-scope, cross-tenant and moved-scope fan-out defects made stale or foreign grants reachable without attacker effort.
+
+Two threats keep their rating but had control claims corrected:
+
+- **T10** (Inacceptable): C4 (`authorize?: true` defaults) and C14 (policy-coverage helper) were ineffective before PR #14; see the T10 section.
+- **T16** (Undesirable): C19's "Tolerable when the CLI is in the runbook" rested on the rotation tool re-wrapping the right DEK, which it did not; see the T16 section.
+
+Notes on T4 (recovery-path tag truncation), T12 (malformed-key DoS), T14 (ECIES KDF binding), T18 (`expires_at: nil`), T19 (renew ordering) and T25 (`ValidateConfig` gaps) record findings that did not change a rating. Open findings are listed in `09_inspection.md`.
 
 ### What changed since v0.2.0
 

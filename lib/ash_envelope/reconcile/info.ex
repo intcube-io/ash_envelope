@@ -93,6 +93,7 @@ defmodule AshEnvelope.Reconcile.Info do
       subject_id_attribute: ok_or_nil(reconcile_key_grants_subject_id_attribute(resource)),
       principal_id_attribute: ok_or_nil(reconcile_key_grants_principal_id_attribute(resource)),
       dek_attribute: ok_or_nil(reconcile_key_grants_dek_attribute(resource)),
+      expires_at_attribute: ok_or_nil(reconcile_key_grants_expires_at_attribute(resource)),
       authorize?: reconcile_key_grants_authorize?(resource)
     )
   end

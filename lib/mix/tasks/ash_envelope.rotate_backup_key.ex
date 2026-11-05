@@ -109,28 +109,35 @@ defmodule Mix.Tasks.AshEnvelope.RotateBackupKey do
       |> maybe_put(:previous_private_key, previous_private_key)
 
     totals =
-      Enum.reduce(resources, %{rotated: 0, skipped: %{}, remaining_stale: 0}, fn resource, acc ->
-        Mix.shell().info("rotating #{inspect(resource)} ...")
+      Enum.reduce(
+        resources,
+        %{rotated: 0, skipped: %{}, failed: %{}, remaining_stale: 0},
+        fn resource, acc ->
+          Mix.shell().info("rotating #{inspect(resource)} ...")
 
-        case rotate_resource(resource, run_opts) do
-          {:ok, result} ->
-            Mix.shell().info(
-              "  #{inspect(resource)}: rotated=#{result.rotated} remaining_stale=#{result.remaining_stale} skipped=#{inspect(result.skipped)}"
-            )
+          case rotate_resource(resource, run_opts) do
+            {:ok, result} ->
+              Mix.shell().info(
+                "  #{inspect(resource)}: rotated=#{result.rotated} remaining_stale=#{result.remaining_stale} failed=#{inspect(result.failed)} skipped=#{inspect(result.skipped)}"
+              )
 
-            merge_totals(acc, result)
+              merge_totals(acc, result)
 
-          {:error, reason} ->
-            Mix.shell().error("  #{inspect(resource)}: rotation failed: #{format_reason(reason)}")
+            {:error, reason} ->
+              Mix.shell().error(
+                "  #{inspect(resource)}: rotation failed: #{format_reason(reason)}"
+              )
 
-            exit({:shutdown, 1})
+              exit({:shutdown, 1})
+          end
         end
-      end)
+      )
 
     Mix.shell().info("---")
     Mix.shell().info("totals:")
     Mix.shell().info("  rotated: #{totals.rotated}")
     Mix.shell().info("  remaining_stale: #{totals.remaining_stale}")
+    Mix.shell().info("  failed: #{inspect(totals.failed)}")
     Mix.shell().info("  skipped: #{inspect(totals.skipped)}")
 
     if totals.remaining_stale > 0 do
@@ -206,10 +213,11 @@ defmodule Mix.Tasks.AshEnvelope.RotateBackupKey do
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp merge_totals(acc, %{rotated: r, skipped: s, remaining_stale: rs}) do
+  defp merge_totals(acc, %{rotated: r, skipped: s, failed: f, remaining_stale: rs}) do
     %{
       rotated: acc.rotated + r,
       remaining_stale: acc.remaining_stale + rs,
+      failed: Map.merge(acc.failed, f, fn _k, a, b -> a + b end),
       skipped: Map.merge(acc.skipped, s, fn _k, a, b -> a + b end)
     }
   end

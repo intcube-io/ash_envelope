@@ -102,4 +102,16 @@ defmodule AshEnvelope.Reconcile.AffectsDslTest do
              )
     end
   end
+
+  describe "key grants config" do
+    test "key_grants_expires_at_attribute flows into the built Config" do
+      {:ok, ctx} = Info.context(DocumentWithAffects)
+
+      assert %AshEnvelope.KeyGrants.Config{
+               resource: AshEnvelope.Test.Reconcile.Grant,
+               subject_id_attribute: :document_id,
+               expires_at_attribute: :expires_at
+             } = ctx.key_grants_config
+    end
+  end
 end

@@ -134,6 +134,43 @@ defmodule AshEnvelope.Reconcile.SyncPrincipalLookupTest do
     end
   end
 
+  describe "scope resolving to an empty list" do
+    # `Keyword.keyword?([])` is true, so a scope returning `[]` used to be
+    # treated as an empty keyword filter — matching the ENTIRE table and
+    # revoking any grant not backed by the read policy (including manually
+    # issued ones). `[]` must mean "no subjects": a no-op.
+    test "is a no-op — no fan-out, manually issued grants untouched" do
+      actor = make_user(:user)
+      target = make_user(:user)
+
+      # Manually issued grant NOT backed by the read policy — target has
+      # no membership on this document.
+      manual_doc = make_document()
+      dek = AshEnvelope.generate_dek()
+      :ok = KeyGrants.create_for_actor(grants_config(), manual_doc.id, dek, actor, @domain)
+      :ok = KeyGrants.share(grants_config(), manual_doc.id, actor, target, @domain)
+
+      # The affecting write itself targets a different document.
+      other_doc = make_document()
+
+      {:ok, _membership} =
+        Ash.create(
+          Membership,
+          %{user_id: target.id, document_id: other_doc.id},
+          action: :empty_scope_create,
+          actor: actor,
+          domain: @domain
+        )
+
+      # The out-of-policy grant survives — no whole-table fan-out.
+      assert {:ok, %_{}} = grant_for(target, manual_doc)
+
+      # And no grants/requests were issued for the empty scope either.
+      assert {:ok, nil} = grant_for(target, other_doc)
+      assert {:ok, nil} = pending_request_for(target, other_doc)
+    end
+  end
+
   describe "lookup hits no entry" do
     test "no `affects` entry for a non-listed action ⇒ change is a no-op" do
       actor = make_user(:user)

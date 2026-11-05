@@ -6,8 +6,22 @@ defmodule AshEnvelopeTest do
   # Flip the lowest bit of the byte at `byte_index`, leaving the rest of
   # the binary untouched — the smallest possible tamper.
   defp flip_bit(binary, byte_index) do
-    <<prefix::binary-size(byte_index), byte, rest::binary>> = binary
+    <<prefix::binary-size(^byte_index), byte, rest::binary>> = binary
     <<prefix::binary, bxor(byte, 1), rest::binary>>
+  end
+
+  # Same construction as AshEnvelope.wrap_dek/2 but with an arbitrary
+  # inner plaintext, as an attacker holding only the public key could do.
+  defp ecies_wrap(recipient_public_key, inner_plaintext) do
+    {eph_public, eph_private} = :crypto.generate_key(:ecdh, :x25519)
+    shared_secret = :crypto.compute_key(:ecdh, recipient_public_key, eph_private, :x25519)
+    derived_key = AshEnvelope.hkdf_sha256(shared_secret, eph_public, "ash_envelope_v1", 32)
+    iv = :crypto.strong_rand_bytes(12)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(:aes_256_gcm, derived_key, iv, inner_plaintext, "", true)
+
+    eph_public <> iv <> tag <> ciphertext
   end
 
   describe "encrypt/3 and decrypt/3" do
@@ -211,6 +225,25 @@ defmodule AshEnvelopeTest do
       assert AshEnvelope.unwrap_dek(<<0::size(59 * 8)>>, priv) == {:error, :malformed_blob}
     end
 
+    # Anyone holding the recipient's PUBLIC key can produce a blob that
+    # authenticates but whose inner plaintext is not a 32-byte DEK (same
+    # construction as wrap_dek/2 with a different inner plaintext). The
+    # layout check must reject it so no caller ever receives a short
+    # "DEK" and feeds it to AES-256-GCM (which raises on a bad key size).
+    test "inner ciphertext that is not 32 bytes returns :malformed_blob" do
+      {pub, priv} = AshEnvelope.generate_key_pair()
+
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, ""), priv) == {:error, :malformed_blob}
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, "short"), priv) == {:error, :malformed_blob}
+
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, :crypto.strong_rand_bytes(33)), priv) ==
+               {:error, :malformed_blob}
+
+      # Sanity: the same construction with a 32-byte inner plaintext still unwraps.
+      dek = AshEnvelope.generate_dek()
+      assert AshEnvelope.unwrap_dek(ecies_wrap(pub, dek), priv) == {:ok, dek}
+    end
+
     # Regression: an all-zero ephemeral public key is a degenerate
     # X25519 point for which :crypto.compute_key/4 raises. It must
     # surface as :decryption_failed — indistinguishable from tampering —
@@ -272,6 +305,29 @@ defmodule AshEnvelopeTest do
       assert_raise ArgumentError, fn ->
         AshEnvelope.resolve_actor_key(actor, :key)
       end
+    end
+  end
+
+  describe "fetch_actor_key/2" do
+    test "returns {:ok, key} for raw and base64 keys" do
+      raw_key = :crypto.strong_rand_bytes(32)
+
+      assert {:ok, ^raw_key} = AshEnvelope.fetch_actor_key(%{key: raw_key}, :key)
+      assert {:ok, ^raw_key} = AshEnvelope.fetch_actor_key(%{key: Base.encode64(raw_key)}, :key)
+    end
+
+    test "returns {:error, {:missing_actor_key, attr}} for nil actor or nil attribute" do
+      assert {:error, {:missing_actor_key, :key}} = AshEnvelope.fetch_actor_key(nil, :key)
+      assert {:error, {:missing_actor_key, :key}} = AshEnvelope.fetch_actor_key(%{id: 1}, :key)
+    end
+
+    test "returns {:error, {:invalid_actor_key, attr}} without echoing the value" do
+      short = :crypto.strong_rand_bytes(16)
+
+      assert {:error, {:invalid_actor_key, :key}} =
+               AshEnvelope.fetch_actor_key(%{key: Base.encode64(short)}, :key)
+
+      assert {:error, {:invalid_actor_key, :key}} = AshEnvelope.fetch_actor_key(%{key: 42}, :key)
     end
   end
 

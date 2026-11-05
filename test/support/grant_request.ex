@@ -12,7 +12,7 @@ defmodule AshEnvelope.Test.GrantRequest do
   end
 
   actions do
-    defaults [:read, :destroy, update: [:fulfilled_at, :fulfilled_by_id]]
+    defaults [:read, update: [:fulfilled_at, :fulfilled_by_id]]
 
     create :create do
       primary? true
@@ -24,6 +24,21 @@ defmodule AshEnvelope.Test.GrantRequest do
         :requested_at,
         :reason
       ]
+    end
+
+    destroy :destroy do
+      primary? true
+      require_atomic? false
+
+      # Test hook: rows flagged "unrevokable" refuse destruction so
+      # error propagation in revoke paths can be exercised.
+      change fn changeset, _context ->
+        if changeset.data.reason == "unrevokable" do
+          Ash.Changeset.add_error(changeset, field: :reason, message: "cannot revoke")
+        else
+          changeset
+        end
+      end
     end
   end
 

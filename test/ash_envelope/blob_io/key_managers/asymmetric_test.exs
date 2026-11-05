@@ -106,6 +106,35 @@ defmodule AshEnvelope.BlobIO.KeyManagers.AsymmetricTest do
     end
   end
 
+  # A degenerate (all-zero / low-order) X25519 public key on the actor
+  # makes AshEnvelope.wrap_dek/2 raise. Key managers run inside the
+  # BlobIO write pipeline, which scrubs exceptions to an opaque error;
+  # the manager must instead report it like any other bad actor key.
+  describe "degenerate recipient public key" do
+    test "wrap_dek/3 returns :invalid_actor_key instead of raising", %{opts: opts} do
+      dek = AshEnvelope.generate_dek()
+      degenerate = %{id: "d", public_key: <<0::size(32 * 8)>>}
+
+      assert {:error, :invalid_actor_key} = Asymmetric.wrap_dek(dek, write_op(degenerate), opts)
+    end
+
+    test "rewrap_dek/3 returns :invalid_actor_key instead of raising", %{
+      actor: actor,
+      opts: opts
+    } do
+      dek = AshEnvelope.generate_dek()
+      {:ok, wrapped} = Asymmetric.wrap_dek(dek, write_op(actor), opts)
+      degenerate = %{id: "d", public_key: <<0::size(32 * 8)>>}
+
+      rewrap_op = %RewrapOperation{
+        blob_context: BlobContext.new(actor: degenerate),
+        call_opts: [donor_actor: actor]
+      }
+
+      assert {:error, :invalid_actor_key} = Asymmetric.rewrap_dek(wrapped, rewrap_op, opts)
+    end
+  end
+
   describe "rewrap_dek/3" do
     test "rewraps from donor to recipient without touching the DEK", %{
       actor: actor,

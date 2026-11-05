@@ -10,16 +10,23 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
 
     ## Configuration
 
-        layers [
-          {AshStorage.Layer.Encryption,
-           layer_id: "documents",
-           key_manager:
-             {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
-              grants_resource: MyApp.DocumentKeyGrant,
-              domain: MyApp.Storage,
-              actor_public_key_attribute: :public_key,
-              actor_private_key_attribute: :private_key}}
-        ]
+        storage do
+          service {AshStorage.Service.S3, bucket: "private-blobs"}
+          blob_resource MyApp.DocumentBlob
+          attachment_resource MyApp.DocumentAttachment
+
+          layer {AshStorage.Layer.Encryption,
+                 key_manager:
+                   {AshEnvelope.BlobIO.KeyManagers.KeyGrants,
+                    grants_resource: MyApp.DocumentKeyGrant,
+                    domain: MyApp.Storage,
+                    actor_public_key_attribute: :public_key,
+                    actor_private_key_attribute: :private_key},
+                 proxy_base_url: "/storage"},
+                metadata_key: "documents"
+
+          has_one_attached :file
+        end
 
     Options:
 
@@ -35,8 +42,17 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
         pointing at the principal/user. Defaults to `:user_id`.
       * `:dek_attribute` — attribute storing the wrapped DEK blob on a grant
         row. Defaults to `:wrapped_dek`.
-      * `:authorize?` — whether grant create/read run under Ash policies.
-        Defaults to `true`.
+      * `:authorize?` — whether the user-grant create (on write) and the
+        user-grant read (on read) run under Ash policies. Defaults to
+        `true`. The ephemeral worker paths always run system-side
+        (`authorize?: false`): the ephemeral row has no principal and
+        the analyzer read has no actor, so no actor-scoped policy could
+        admit them — the scaffolded read policy (`user_id == ^actor(:id)`)
+        would filter the row away and any create policy would reject the
+        insert, failing every attach. Those paths are gated instead by
+        the user-grant create that precedes the ephemeral insert (which
+        is subject to policies) and by the positive analyzer
+        discriminator on read (see below).
       * `:subject_id_resolver` — function `(BlobContext.t() -> term())` to
         derive the subject id from the blob context. Defaults to
         `& &1.blob.id`. The blob is guaranteed to be set when this is
@@ -83,8 +99,18 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
     @format "ash_envelope_key_grants_v1"
 
     @impl true
-    def wrap_dek(dek, %Writer.Operation{}, _opts) when is_binary(dek) do
-      {:ok, %{"format" => @format} |> Backup.put_backup(Backup.wrap_for_backup(dek)), %{dek: dek}}
+    def wrap_dek(dek, %Writer.Operation{}, opts) when is_binary(dek) do
+      # `wrap_dek/3` runs before the service upload and before the blob
+      # row exists; `finalize_wrapped_dek/3` runs after both. Every option
+      # finalize needs is validated here so a misconfigured manager fails
+      # the write up front instead of leaving an uploaded ciphertext and a
+      # blob row with no grant behind it.
+      with {:ok, _config} <- config_from(opts),
+           {:ok, _domain} <- fetch_option(opts, :domain),
+           :ok <- validate_subject_id_resolver(opts) do
+        {:ok, %{"format" => @format} |> Backup.put_backup(Backup.wrap_for_backup(dek)),
+         %{dek: dek}}
+      end
     end
 
     @impl true
@@ -116,7 +142,7 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
            {:ok, domain} <- fetch_option(opts, :domain),
            {:ok, subject_id} <- resolve_subject_id(bctx, opts) do
         case ephemeral_route(bctx, config) do
-          :ephemeral -> KeyGrants.resolve_ephemeral(config, subject_id, domain)
+          :ephemeral -> KeyGrants.resolve_ephemeral(system_side(config), subject_id, domain)
           :user_grant -> KeyGrants.resolve_for_actor(config, subject_id, bctx.actor, domain)
         end
       end
@@ -160,6 +186,14 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
       end
     end
 
+    defp validate_subject_id_resolver(opts) do
+      case Keyword.get(opts, :subject_id_resolver) do
+        nil -> :ok
+        resolver when is_function(resolver, 1) -> :ok
+        other -> {:error, {:invalid_key_grants_subject_id_resolver, other}}
+      end
+    end
+
     defp fetch_option(opts, key) do
       case Keyword.fetch(opts, key) do
         {:ok, value} when not is_nil(value) -> {:ok, value}
@@ -169,9 +203,18 @@ if Code.ensure_loaded?(AshStorage.Encryption.KeyManager) do
 
     # -- Ephemeral worker grant integration --
 
+    # The ephemeral paths carry neither an actor (analyzer workers run
+    # with `actor: nil`) nor a principal (`user_id IS NULL`), so they can
+    # never satisfy actor-scoped policies on the grants resource. They are
+    # system-side by design: the create only runs after the user-grant
+    # create for the same subject succeeded under policies, and the read
+    # is only reached through `ephemeral_route/2`'s positive discriminator.
+    defp system_side(%AshEnvelope.KeyGrants.Config{} = config), do: %{config | authorize?: false}
+
     defp maybe_create_ephemeral(config, subject_id, dek, domain) do
       if AshEnvelope.KeyGrants.Config.ephemeral_configured?(config) do
-        with {:ok, _record} <- KeyGrants.create_ephemeral(config, subject_id, dek, domain) do
+        with {:ok, _record} <-
+               KeyGrants.create_ephemeral(system_side(config), subject_id, dek, domain) do
           :ok
         end
       else

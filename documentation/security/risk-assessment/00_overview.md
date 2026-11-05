@@ -5,8 +5,8 @@
 | Field | Value |
 |---|---|
 | System under assessment | `ash_envelope` — Elixir library providing envelope-encryption primitives and key-grant management for the Ash framework. |
-| Version / scope | v0.4-dev. Scope expanded from "ash_envelope library as a component" to "ash_envelope + the `ash_storage` surface it integrates with" — see "Scope expansion" below. |
-| Assessment date | 2026-05-11 / 2026-05-12 / 2026-06-02 / 2026-06-05 |
+| Version / scope | v0.4-dev plus the 2026-10 review pass (fixes in PR #14 and in the PRs merged to `main` after the v0.4-dev assessment). Scope unchanged since v0.4-dev, which expanded it from "ash_envelope library as a component" to "ash_envelope + the `ash_storage` surface it integrates with" — see "Scope expansion" below. |
+| Assessment date | 2026-05-11 / 2026-05-12 / 2026-06-02 / 2026-06-05 / 2026-10-29 (review pass) |
 | Assessor | Marc Nickert (maintainer) |
 | Stakeholders consulted | Maintainer (direct). Integrators and data subjects represented vicariously through the regulatory regime in the damage-potential premise. |
 | Depth | Standard (all 9 SQUARE steps, single pass) |
@@ -77,6 +77,7 @@ This assessment uses:
 - **Eight Undesirable risks** (T6, T7, T8, T12, T13, T15, T16, T18) drive concrete library SRs.
 - **Backup-key escrow** (opt-in via `:backup_public_key`) is rated Undesirable under load-bearing EA9 (private key in cold storage / KMS / split). SR19, SR20, EA9 bound the surface and lock the rotation runbook.
 - **Expiring grants** (opt-in via `:expires_at_attribute` on `KeyGrants.Config`) cover both time-bounded user grants and per-attach ephemeral worker grants. Ephemeral rows seal the DEK directly under the env seal key (A10) with AAD = subject id — no intermediate keypair. T17 / T18 / T19 / T20 are the new threats; SR21–SR27 and EA10 cover them. T18 is Undesirable, bounded by `TTL × write_rate`; T17 is Negligible (the seal key alone unlocks nothing without DB read); T19 is Tolerable (mitigated by the `renew_ephemeral_with_actor/5` API shape). Deployments that don't enable the feature retain the v0.3.0 risk profile exactly (SR24 / C23).
+- **2026-10 review pass:** T6 (reconciliation divergence from the read policy) was re-rated: its v0.4-dev rating of Undesirable rested on planner and apply-side controls that did not work on a policy-protected grants table, so the pre-fix code was Inacceptable. PR #14 and the merged PR #8 bring it back to Undesirable (reduced, not closed). T10's controls (C4 `authorize?: true` defaults, C14 policy-coverage helper) were ineffective before PR #14; the rating stays Inacceptable. Matrix counts are unchanged. One deferred finding is P1 (N7, oversized reconcile scope); see `09_inspection.md`.
 - **No risk is retained without an explicit rationale.** The three retentions (T5, T9, T11) cover threat classes that are intrinsic to the framing or upstream of `ash_envelope`: total DB destruction by a DBA, the HTTP serving surface for encrypted blobs (now an `ash_storage` proxy concern), and host-OS / BEAM-node compromise.
 
 ## Scope expansion (v0.4-dev)
@@ -99,6 +100,19 @@ The v0.4-dev pass also closes the two **previously-deferred minor findings** fro
 Plus SR33 — documentation commitment for `AshStorage.Service.Mirror` partial-write semantics — supersedes the prior "no library SR" treatment of T23. Helper-strengthening: `AshEnvelope.TestHelpers.assert_policies_defined!/2` now checks per-action-type policy coverage by default, catching the common scaffold mistake of leaving the `:create` sharing-model branch commented out.
 
 After the v0.4-dev pass, no deferred minor findings remain in the inspection table.
+
+## Implementation status (2026-10 review pass)
+
+An October 2026 code review of `main` at b799f14 (four parallel reviewers: crypto core; key grants and grant requests; reconcile; generators, helpers, docs and tooling) produced 23 new findings (N1-N23) and re-confirmed the findings carried by five open PRs. PR #14 consolidates those PRs (#6, #7, #9, #10, #11), the new fix commits, and an Elixir 1.20 / Ash 3.37 update. PRs #3, #5 and #8, merged to `main` after the v0.4-dev assessment, are included in this pass because the assessment did not yet reflect them.
+
+- **Reconcile correctness (T6).** The planner's grant-existence read now runs system-side and is expiry-aware, `Ash.can?` fails closed on `:maybe`, a scope resolving to `[]` reconciles nothing, an update that changes the scope input reconciles the old and the new subjects, the tenant is threaded through every reconcile call and async job, failures are returned and retried instead of only logged (merged PR #8), the async job is inserted inside the triggering transaction, and the `:actor` granter falls through to `:request` when the actor cannot open its own grant. New SR36 (tenant scoping) and SR37 (failure surfacing); SR8 extended. T6 re-rated, see `04_risk_assessment.md`.
+- **Authorization (T10).** `KeyGrants` and `GrantRequests` pass a real actor on every Ash call, so scaffold-shaped policies work under the `authorize?: true` default; `fulfill/7` rejects a mismatched target; `share/6` needs only the target's public key; the `KeyGrants` BlobIO manager runs only the ephemeral worker paths system-side. `assert_policies_defined!/2` rejects vacuous `authorize_if always()` coverage. SR13 and SR14 extended.
+- **Crypto and recovery paths (T4, T12, T16).** `recover_plaintext/3` enforces 12-byte IV, 16-byte tag and 32-byte DEK; `unwrap_dek/2` only returns 32-byte DEKs; malformed or degenerate principal keys return error tuples (new SR38); backup rotation re-wraps from the stored row and reports failures by reason; the rotation task rejects unknown switches (merged PR #5). SR3, SR19, SR20 extended.
+- **Generators (T6, T10).** Scaffolds emit the `storage do` DSL the pinned `ash_storage` accepts, key grants and requests by blob id with a matching `reconcile do` mapping, and thread the actor through the LiveView revoke handler (merged PR #5). New SR39.
+- **Verification infrastructure.** CI had not run any check from 2026-06-01 until the merged PR #4, so "verified by CI" claims in that window rested on local runs only. PR #14 runs CI on Elixir 1.20 / OTP 28 and adds `mix hex.audit` and `mix deps.audit`; the Ash 3.37.2 update clears a Hex-flagged Ash advisory and the two transitive advisories the review found.
+- **Open.** N7 (P1), N12, N13, N15, N17, N20 (P2), and N11, N16, N21, N23 plus four residuals (P3) are recorded in `08_prioritization.md` and `09_inspection.md`.
+
+New in this pass: SR36-SR39, C30-C39. No new threats, assets or environmental assumptions.
 
 ## Implementation status (v0.4-dev)
 

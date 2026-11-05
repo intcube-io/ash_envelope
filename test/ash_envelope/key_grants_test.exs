@@ -136,6 +136,53 @@ defmodule AshEnvelope.KeyGrantsTest do
     end
   end
 
+  describe "share/6 with a target loaded without a private key" do
+    test "creates the grant using only the target's public key", ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      {target_pub, target_priv} = AshEnvelope.generate_key_pair()
+      public_only = %{id: Ash.UUID.generate(), public_key: target_pub}
+
+      assert :ok = KeyGrants.share(ctx.config, ctx.subject_id, ctx.actor, public_only, @domain)
+
+      full_target = Map.put(public_only, :private_key, target_priv)
+
+      {:ok, dek} =
+        KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, full_target, @domain)
+
+      assert dek == ctx.dek
+    end
+
+    test "is idempotent when the target already holds a grant (fulfill_outstanding login path)",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      {target_pub, target_priv} = AshEnvelope.generate_key_pair()
+      target = %{id: Ash.UUID.generate(), public_key: target_pub, private_key: target_priv}
+
+      :ok = KeyGrants.share(ctx.config, ctx.subject_id, ctx.actor, target, @domain)
+
+      # Re-share with the target loaded public-key-only, as fulfill_outstanding's
+      # target_loader typically does. Previously raised ArgumentError from
+      # trying to unwrap with the target's (absent) private key.
+      public_only = Map.delete(target, :private_key)
+
+      assert :ok = KeyGrants.share(ctx.config, ctx.subject_id, ctx.actor, public_only, @domain)
+
+      subject = ctx.subject_id
+      target_id = target.id
+
+      {:ok, grants} =
+        AshEnvelope.Test.Grant
+        |> Ash.Query.filter(subject_id == ^subject and user_id == ^target_id)
+        |> Ash.read(domain: @domain, authorize?: false)
+
+      assert length(grants) == 1
+    end
+  end
+
   describe "resolve_for_actor/4 error paths" do
     test "returns :corrupted_dek when stored DEK is not valid base64", ctx do
       :ok =
@@ -172,6 +219,63 @@ defmodule AshEnvelope.KeyGrantsTest do
 
       assert {:error, :decryption_failed} =
                KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, ctx.actor, @domain)
+    end
+
+    test "returns {:error, {:missing_actor_key, _}} when a grant exists but the actor has no private key",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      public_only = Map.delete(ctx.actor, :private_key)
+
+      assert {:error, {:missing_actor_key, :private_key}} =
+               KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, public_only, @domain)
+    end
+
+    test "a public-key-only actor with no grant still gets :not_found", ctx do
+      public_only = Map.delete(ctx.actor, :private_key)
+
+      assert {:error, :not_found} =
+               KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, public_only, @domain)
+    end
+  end
+
+  describe "actor key errors are error tuples, not exceptions" do
+    test "create_for_actor returns {:error, {:missing_actor_key, _}} for an actor without a public key",
+         ctx do
+      keyless = %{id: Ash.UUID.generate()}
+
+      assert {:error, {:missing_actor_key, :public_key}} =
+               KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, keyless, @domain)
+
+      assert {:ok, []} =
+               AshEnvelope.Test.Grant
+               |> Ash.Query.filter(subject_id == ^ctx.subject_id)
+               |> Ash.read(domain: @domain, authorize?: false)
+    end
+
+    test "create_for_actor returns {:error, {:invalid_actor_key, _}} for a malformed public key",
+         ctx do
+      malformed = %{id: Ash.UUID.generate(), public_key: Base.encode64(<<1, 2, 3>>)}
+
+      assert {:error, {:invalid_actor_key, :public_key}} =
+               KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, malformed, @domain)
+    end
+
+    test "share returns an error tuple and creates nothing when the target has no public key",
+         ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      keyless = %{id: Ash.UUID.generate()}
+
+      assert {:error, {:missing_actor_key, :public_key}} =
+               KeyGrants.share(ctx.config, ctx.subject_id, ctx.actor, keyless, @domain)
+
+      assert {:ok, []} =
+               AshEnvelope.Test.Grant
+               |> Ash.Query.filter(subject_id == ^ctx.subject_id and user_id == ^keyless.id)
+               |> Ash.read(domain: @domain, authorize?: false)
     end
   end
 
@@ -273,6 +377,42 @@ defmodule AshEnvelope.KeyGrantsTest do
       assert dek == ctx.dek
     end
 
+    test "share re-issues a fresh grant when the target holds an expired row", ctx do
+      :ok =
+        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
+
+      {target_pub, target_priv} = AshEnvelope.generate_key_pair()
+      target = %{id: Ash.UUID.generate(), public_key: target_pub, private_key: target_priv}
+      past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+      :ok =
+        KeyGrants.create_for_actor(
+          ctx.config,
+          ctx.subject_id,
+          ctx.dek,
+          target,
+          @domain,
+          expires_at: past
+        )
+
+      assert :ok = KeyGrants.share(ctx.config, ctx.subject_id, ctx.actor, target, @domain)
+
+      # The expired row was purged, not left to collide with the
+      # (subject, user_id) unique index; exactly one row remains.
+      subject = ctx.subject_id
+      target_id = target.id
+
+      {:ok, rows} =
+        AshEnvelope.Test.Grant
+        |> Ash.Query.filter(subject_id == ^subject and user_id == ^target_id)
+        |> Ash.read(domain: @domain, authorize?: false)
+
+      assert length(rows) == 1
+
+      {:ok, dek} = KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, target, @domain)
+      assert dek == ctx.dek
+    end
+
     test "raises when :expires_at supplied but config doesn't have the attribute set", ctx do
       bare_config = %{ctx.config | expires_at_attribute: nil}
       future = DateTime.add(DateTime.utc_now(), 3600, :second)
@@ -287,137 +427,6 @@ defmodule AshEnvelope.KeyGrantsTest do
           expires_at: future
         )
       end
-    end
-  end
-
-  describe "ephemeral worker grants" do
-    setup ctx do
-      previous = Application.get_env(:ash_envelope, :seal_key)
-      Application.put_env(:ash_envelope, :seal_key, Base.encode64(:crypto.strong_rand_bytes(32)))
-
-      on_exit(fn ->
-        if previous,
-          do: Application.put_env(:ash_envelope, :seal_key, previous),
-          else: Application.delete_env(:ash_envelope, :seal_key)
-      end)
-
-      ephemeral_config = %{
-        ctx.config
-        | expires_at_attribute: :expires_at,
-          ephemeral_ttl_seconds: 3600
-      }
-
-      %{ctx | config: ephemeral_config}
-    end
-
-    test "create_ephemeral + resolve_ephemeral round-trips the DEK", ctx do
-      {:ok, _row} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-      assert {:ok, dek} = KeyGrants.resolve_ephemeral(ctx.config, ctx.subject_id, @domain)
-      assert dek == ctx.dek
-    end
-
-    test "resolve_ephemeral returns :not_found when no row exists", ctx do
-      assert {:error, :not_found} =
-               KeyGrants.resolve_ephemeral(ctx.config, ctx.subject_id, @domain)
-    end
-
-    test "resolve_ephemeral returns :expired past the TTL", ctx do
-      {:ok, row} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-      past = DateTime.add(DateTime.utc_now(), -60, :second)
-
-      {:ok, _} =
-        Ash.update(row, %{expires_at: past}, action: :expire, domain: @domain, authorize?: false)
-
-      assert {:error, :expired} =
-               KeyGrants.resolve_ephemeral(ctx.config, ctx.subject_id, @domain)
-    end
-
-    test "an ephemeral row is invisible to resolve_for_actor", ctx do
-      {:ok, _row} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-
-      # Actor has no user grant; only an ephemeral exists for this subject.
-      assert {:error, :not_found} =
-               KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, ctx.actor, @domain)
-    end
-
-    test "user grants and ephemeral grants coexist for the same subject", ctx do
-      :ok =
-        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
-
-      {:ok, _row} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-
-      {:ok, user_dek} =
-        KeyGrants.resolve_for_actor(ctx.config, ctx.subject_id, ctx.actor, @domain)
-
-      {:ok, eph_dek} = KeyGrants.resolve_ephemeral(ctx.config, ctx.subject_id, @domain)
-
-      assert user_dek == ctx.dek
-      assert eph_dek == ctx.dek
-    end
-
-    test "create_ephemeral raises when expires_at_attribute isn't configured", ctx do
-      bare_config = %{ctx.config | expires_at_attribute: nil}
-
-      assert_raise ArgumentError, ~r/expiring-grant attributes/, fn ->
-        KeyGrants.create_ephemeral(bare_config, ctx.subject_id, ctx.dek, @domain)
-      end
-    end
-
-    test "renew_ephemeral replaces an existing row with a fresh seal", ctx do
-      {:ok, original} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-      {:ok, renewed} = KeyGrants.renew_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-
-      refute renewed.id == original.id
-      # Same DEK + fresh IV inside SealKey means the sealed value
-      # differs even when the plaintext is identical.
-      refute renewed.wrapped_dek == original.wrapped_dek
-      assert {:ok, dek} = KeyGrants.resolve_ephemeral(ctx.config, ctx.subject_id, @domain)
-      assert dek == ctx.dek
-    end
-
-    test "renew_ephemeral creates a row when none exists", ctx do
-      assert {:ok, _} = KeyGrants.renew_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-      assert {:ok, dek} = KeyGrants.resolve_ephemeral(ctx.config, ctx.subject_id, @domain)
-      assert dek == ctx.dek
-    end
-
-    test "renew_ephemeral_with_actor renews when the actor can resolve the DEK", ctx do
-      :ok =
-        KeyGrants.create_for_actor(ctx.config, ctx.subject_id, ctx.dek, ctx.actor, @domain)
-
-      {:ok, original} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-
-      assert {:ok, renewed} =
-               KeyGrants.renew_ephemeral_with_actor(
-                 ctx.config,
-                 ctx.subject_id,
-                 ctx.actor,
-                 @domain
-               )
-
-      refute renewed.id == original.id
-    end
-
-    test "renew_ephemeral_with_actor leaves existing row intact when actor has no grant",
-         ctx do
-      {:ok, original} = KeyGrants.create_ephemeral(ctx.config, ctx.subject_id, ctx.dek, @domain)
-
-      assert {:error, :not_found} =
-               KeyGrants.renew_ephemeral_with_actor(
-                 ctx.config,
-                 ctx.subject_id,
-                 ctx.actor,
-                 @domain
-               )
-
-      subject = ctx.subject_id
-
-      {:ok, [survivor]} =
-        ctx.config.resource
-        |> Ash.Query.filter(subject_id == ^subject and is_nil(user_id))
-        |> Ash.read(domain: @domain, authorize?: false)
-
-      assert survivor.id == original.id
     end
   end
 

@@ -19,9 +19,27 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     user resource itself).
   - `:scope` *(optional)* — either `:all` (every encrypted record) or
     a `(Ash.Changeset.t() -> Ash.Query.t() | keyword() | [term()])` filter.
+    On an `:update` that changes attributes, the function is evaluated
+    twice — against the changeset as-is and against a pre-change view
+    whose `Ash.Changeset.get_attribute/2` falls back to the stored data
+    — and the union is reconciled, so subjects the principal *used to*
+    match (e.g. the org a membership was moved away from) have their
+    grants revoked.
+    A function returning a keyword list filters the encrypted resource; a
+    bare list is treated as subject ids. An empty list means "no
+    subjects" and the change is a no-op.
   - `:only_when` *(optional)* — `(Ash.Changeset.t() -> boolean())`. When
     it returns `false`, the change is a no-op. Useful for `User.update`
     actions that only matter when a specific attribute changes.
+
+  ## Hook timing
+
+  In `:sync` mode reconciliation runs in `after_transaction`, post-commit
+  — the fan-out (policy checks + grant writes) shouldn't hold the
+  triggering transaction open. In `:async` mode the scope is resolved and
+  the Oban job inserted in `after_action`, *inside* the transaction, so
+  the job commits (or rolls back) atomically with the triggering write —
+  a crash after commit can't silently drop the reconciliation.
 
   ## Lookup form (preferred)
 
@@ -74,13 +92,30 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
   @impl true
   def change(changeset, opts, _context) do
-    Ash.Changeset.after_transaction(changeset, fn cs, result ->
-      case result do
-        {:ok, _} -> maybe_run(cs, opts, result)
-        :ok -> maybe_run(cs, opts, result)
-        _ -> result
-      end
-    end)
+    encrypted = Keyword.fetch!(opts, :encrypted_resource)
+
+    case Mode.resolve(opts, encrypted) do
+      :async ->
+        # Enqueue inside the action's transaction (`after_action`) rather
+        # than post-commit (`after_transaction`): a crash between commit
+        # and `Oban.insert!` would otherwise lose the reconciliation
+        # permanently. With the standard setup (Oban sharing the
+        # resource's repo) the job row commits atomically with the
+        # triggering write; a failed insert rolls the write back.
+        Ash.Changeset.after_action(changeset, fn cs, record ->
+          maybe_run(cs, opts, {:ok, record})
+          {:ok, record}
+        end)
+
+      :sync ->
+        Ash.Changeset.after_transaction(changeset, fn cs, result ->
+          case result do
+            {:ok, _} -> maybe_run(cs, opts, result)
+            :ok -> maybe_run(cs, opts, result)
+            _ -> result
+          end
+        end)
+    end
   end
 
   defp maybe_run(cs, opts, result) do
@@ -145,8 +180,8 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
       ids ->
         with {:ok, ctx} <- Info.context(encrypted),
-             ctx = %{ctx | actor: actor, changeset: cs},
-             {:ok, subjects} <- enumerate_subjects(ctx, scope, cs) do
+             ctx = %{ctx | actor: actor, changeset: cs, tenant: cs.tenant},
+             {:ok, subjects} <- enumerate_scope_subjects(ctx, scope, cs) do
           pairs = for id <- ids, subject <- subjects, do: {id, subject}
           execute(Mode.resolve(opts, encrypted), ctx, pairs, result)
         else
@@ -191,15 +226,21 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     end
 
     encrypted = ctx.encrypted_resource
-    queue = ok_or(Info.reconcile_oban_queue(encrypted), :ash_envelope_reconcile)
-    chunk_size = ok_or(Info.reconcile_oban_chunk_size(encrypted), 5000)
+    queue = Info.reconcile_oban_queue!(encrypted)
+    chunk_size = Info.reconcile_oban_chunk_size!(encrypted)
+    oban_name = Info.reconcile_oban_name!(encrypted)
     actor_id = ctx.actor && Map.get(ctx.actor, :id)
+
+    # Struct tenants (context multitenancy) don't survive a JSON
+    # round-trip; serialize the primitive via `Ash.ToTenant` and let the
+    # worker put it back on the rebuilt context.
+    tenant = Ash.ToTenant.to_tenant(ctx.tenant, encrypted)
 
     # Pairs may now span multiple principals (e.g. an `:update` that
     # reassigns the FK reconciles both old and new). Group by principal_id
     # so each Oban job carries one principal + its subject ids.
     pairs
-    |> Enum.group_by(fn {pid, _} -> pid end, fn {_, subject} -> Map.get(subject, :id) end)
+    |> Enum.group_by(fn {pid, _} -> pid end, fn {_, subject} -> subject_id(subject) end)
     |> Enum.each(fn {principal_id, subject_ids} ->
       subject_ids
       |> Enum.reject(&is_nil/1)
@@ -209,35 +250,71 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
           "encrypted_resource" => Atom.to_string(encrypted),
           "principal_id" => principal_id,
           "actor_id" => actor_id,
-          "subject_ids" => chunk
+          "subject_ids" => chunk,
+          "tenant" => tenant
         }
 
-        enqueue(args, queue)
+        enqueue(args, queue, oban_name)
       end)
     end)
 
     :ok
   end
 
+  # Scope functions may return loaded records *or* bare subject ids (the
+  # `affects` scope docs allow both, and the sync path handles either via
+  # `Runner.load_subject/2`). Mirror that here when building job args.
+  defp subject_id(subject) when is_map(subject), do: Map.get(subject, :id)
+  defp subject_id(id), do: id
+
   # Test hook: a 2-arity function `(args, queue) -> any` registered under
   # `Application.get_env(:ash_envelope, :reconcile_async_enqueuer)` is
-  # called instead of `Oban.insert!/1`. Used by the test suite to capture
+  # called instead of `Oban.insert!/2`. Used by the test suite to capture
   # enqueued jobs without standing up Oban + Postgres. In production this
-  # falls through to `Oban.insert!/1`.
-  defp enqueue(args, queue) do
+  # falls through to `Oban.insert!/2` against the instance configured via
+  # `reconcile do oban_name end` (default `Oban`).
+  defp enqueue(args, queue, oban_name) do
     case Application.get_env(:ash_envelope, :reconcile_async_enqueuer) do
       nil ->
-        args
-        |> AshEnvelope.Reconcile.AsyncWorker.new(queue: queue)
-        |> Oban.insert!()
+        changeset = AshEnvelope.Reconcile.AsyncWorker.new(args, queue: queue)
+        Oban.insert!(oban_name, changeset)
 
       fun when is_function(fun, 2) ->
         fun.(args, queue)
     end
   end
 
-  defp ok_or({:ok, value}, _default), do: value
-  defp ok_or(_, default), do: default
+  # The scope is a function of the changeset, so on an `:update` that
+  # changes an attribute the scope depends on (a membership reassigned
+  # from org A to org B, say) evaluating it once against the post-change
+  # changeset only yields the *new* subjects. The subjects the principal
+  # was authorized on *before* the change would never be reconciled and
+  # their grants never revoked. Mirror the old+new handling of the
+  # principal id: evaluate the scope against the changeset as-is and
+  # against a pre-change view (attributes cleared so
+  # `Ash.Changeset.get_attribute/2` falls back to the stored data), and
+  # reconcile the union.
+  defp enumerate_scope_subjects(
+         ctx,
+         scope,
+         %Ash.Changeset{action_type: :update, attributes: attrs} = cs
+       )
+       when is_function(scope, 1) and map_size(attrs) > 0 do
+    before_cs = %{cs | attributes: %{}}
+
+    with {:ok, after_subjects} <- enumerate_subjects(ctx, scope, cs),
+         {:ok, before_subjects} <- enumerate_subjects(ctx, scope, before_cs) do
+      pk = Ash.Resource.Info.primary_key(ctx.encrypted_resource)
+      {:ok, Enum.uniq_by(after_subjects ++ before_subjects, &subject_key(&1, pk))}
+    end
+  end
+
+  defp enumerate_scope_subjects(ctx, scope, cs), do: enumerate_subjects(ctx, scope, cs)
+
+  # Scope results are either loaded encrypted-resource records or bare
+  # subject ids; key records by primary key so the union dedupes.
+  defp subject_key(%_{} = record, pk), do: Map.take(record, pk)
+  defp subject_key(id, _pk), do: id
 
   defp enumerate_subjects(ctx, :all, _cs),
     do: read_subjects(ctx.encrypted_resource, ctx)
@@ -247,6 +324,12 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
 
   defp enumerate_subjects(_ctx, scope, _cs),
     do: {:error, {:unsupported_scope, scope}}
+
+  # `Keyword.keyword?([])` is true, so without this clause an empty list
+  # would fall through below as an empty keyword filter and match the
+  # ENTIRE table — fanning reconciliation out over every subject. A scope
+  # resolving to `[]` means "no subjects": do nothing.
+  defp enumerate_filter_result(_ctx, []), do: {:ok, []}
 
   defp enumerate_filter_result(ctx, list) when is_list(list) do
     if Keyword.keyword?(list) do
@@ -284,7 +367,12 @@ defmodule AshEnvelope.Reconcile.Changes.SyncPrincipal do
     try do
       list =
         query
-        |> Ash.stream!(domain: ctx.domain, authorize?: false, batch_size: 500)
+        |> Ash.stream!(
+          domain: ctx.domain,
+          tenant: ctx.tenant,
+          authorize?: false,
+          batch_size: 500
+        )
         |> Enum.take(max + 1)
 
       if length(list) > max do
